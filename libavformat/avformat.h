@@ -328,6 +328,14 @@
 #include "libavcodec/codec.h"
 #endif
 
+struct RTPDemuxContext;
+struct RTPMuxContext;
+
+union RTPParentMuxContext {
+    struct RTPDemuxContext* d;
+    struct RTPMuxContext* m;
+};
+
 struct AVFormatContext;
 struct AVFrame;
 
@@ -1248,6 +1256,17 @@ enum AVDurationEstimationMethod {
     AVFMT_DURATION_FROM_BITRATE ///< Duration estimated from bitrate (less accurate)
 };
 
+#define AVCIPHERCB_VALIDPARAM       0x0001 /**< indicate that param is valid, not cached */
+#define AVCIPHERCB_VALIDINPUTCTR    0x0002 /**< indicate that input_ctr is valid, not partial */
+#define AVCIPHERCB_ENCRYPT          0x0004 /**< callback is encrypting (sender), not decrypting */
+
+struct AVCipherCB {
+    int (*callback)(void* opaque, uint32_t param,
+        uint64_t input_ctr, uint8_t* buf, size_t len, int flags);
+    void* opaque;
+    uint32_t param; /* union of stream_ctr and key_version */
+};
+
 /**
  * Format I/O context.
  * New fields can be added to the end with minor version bumps.
@@ -1888,6 +1907,33 @@ typedef struct AVFormatContext {
      * Name of this format context, only used for logging purposes.
      */
     char *name;
+
+    /* HDCP and PEP configuration and state */
+    struct AVCipherCB video_hdcp_cipher;
+    struct AVCipherCB audio_hdcp_cipher;
+    struct AVCipherCB data_hdcp_cipher;
+    struct AVCipherCB video_privacy_cipher;
+    struct AVCipherCB audio_privacy_cipher;
+    struct AVCipherCB data_privacy_cipher;
+
+    // Indicate the first packet of an encrypted sequence of packets. => using full extended header
+    int full_ctr;
+    int payload_header_size;
+    union RTPParentMuxContext parent;
+
+    int hdcp_scramble;
+    int privacy_scramble;
+
+    /* PEP (TR-10-13) real encryption — mutually exclusive with privacy_scramble */
+    int privacy_encrypt;       /**< enable real PEP encryption on RTP streams */
+    char *pep_psk;             /**< pre-shared key (hex) */
+    char *pep_mode;            /**< cipher mode string (e.g. "AES-128-CTR") */
+    char *pep_iv;              /**< base IV (hex, 16 hex digits = 8 bytes) */
+    char *pep_key_generator;   /**< key generator (hex, 32 hex digits = 16 bytes) */
+    char *pep_key_version;     /**< initial key version (hex, 8 hex digits = 4 bytes) */
+    int pep_rtp_kv;            /**< 1 = RTP_KV dynamic key versioning, 0 = RTP */
+    int pep_kv_rotate;         /**< debug: rotate key_version every N frame boundaries (0=disabled, requires pep_rtp_kv) */
+    int privacy_mac_size;      /**< 0 for CTR-only, 8 for CMAC modes (set by rtp_pep_init) */
 } AVFormatContext;
 
 /**

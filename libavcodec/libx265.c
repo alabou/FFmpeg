@@ -608,7 +608,11 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
         return AVERROR_INVALIDDATA;
     }
 
-    if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
+    /* Publish VPS/SPS/PPS into extradata when either GLOBAL_HEADER (out-of-band-only)
+     * or AV_CODEC_FLAG2_EXTRADATA (publish-also; in-band repetition stays controlled
+     * by the GLOBAL_HEADER-bound logic above) is set. */
+    if ((avctx->flags  & AV_CODEC_FLAG_GLOBAL_HEADER) ||
+        (avctx->flags2 & AV_CODEC_FLAG2_EXTRADATA)) {
         x265_nal *nal;
         int nnal;
 

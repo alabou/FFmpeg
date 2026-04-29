@@ -428,7 +428,13 @@ static av_cold int aac_encode_init(AVCodecContext *avctx)
 #endif
     ff_af_queue_init(avctx, &s->afq);
 
-    if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
+    /* Publish AudioSpecificConfig into extradata when either GLOBAL_HEADER or
+     * AV_CODEC_FLAG2_EXTRADATA is set. The transport-type and signaling choices
+     * earlier in this function (around the TT_MP4_RAW selection and signaling
+     * mode) remain bound strictly to GLOBAL_HEADER — they affect wire format,
+     * not extradata publication. */
+    if ((avctx->flags  & AV_CODEC_FLAG_GLOBAL_HEADER) ||
+        (avctx->flags2 & AV_CODEC_FLAG2_EXTRADATA)) {
         avctx->extradata_size = info.confSize;
         avctx->extradata      = av_mallocz(avctx->extradata_size +
                                            AV_INPUT_BUFFER_PADDING_SIZE);

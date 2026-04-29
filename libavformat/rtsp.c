@@ -55,6 +55,7 @@
 #include "url.h"
 #include "tls.h"
 #include "rtpenc.h"
+#include "rtp_pep.h"
 #include "mpegts.h"
 #include "version.h"
 
@@ -690,6 +691,8 @@ static void sdp_parse_line(AVFormatContext *s, SDPParseState *s1,
             p += strspn(p, SPACE_CHARS);
             if (av_strstart(p, "inline:", &p))
                 get_word(rtsp_st->crypto_params, sizeof(rtsp_st->crypto_params), &p);
+        } else if (av_strstart(p, "privacy:", &p)) {
+            ff_rtp_pep_parse_sdp_privacy(s, p);
         } else if (av_strstart(p, "source-filter:", &p)) {
             int exclude = 0;
             get_word(buf1, sizeof(buf1), &p);

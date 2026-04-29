@@ -30,6 +30,18 @@ OBJS-$(CONFIG_FBDEV_OUTDEV)              += fbdev_enc.o \
                                             fbdev_common.o
 OBJS-$(CONFIG_GDIGRAB_INDEV)             += gdigrab.o
 OBJS-$(CONFIG_IEC61883_INDEV)            += iec61883.o
+OBJS-$(CONFIG_IPMX_USB_INDEV)           += ipmx_usb.o ipmx_usb_common.o \
+                                            ipmx_usb_proto.o ipmx_usb_pep.o \
+                                            ipmx_usb_uvc.o ipmx_usb_uac.o \
+                                            ipmx_usb_quirks.o \
+                                            ipmx_usb_clockrec.o
+OBJS-$(CONFIG_IPMX_USB_SENDER_OUTDEV)  += ipmx_usb_sender.o ipmx_usb_common.o \
+                                            ipmx_usb_proto.o ipmx_usb_pep.o \
+                                            ipmx_usb_quirks.o ipmx_usb_uvc_seg.o \
+                                            ipmx_usb_uac_pack.o ipmx_usb_virt_desc.o
+OBJS-$(CONFIG_IPMX_USB_LOCAL_INDEV)    += ipmx_usb_local.o \
+                                            ipmx_usb_uvc.o ipmx_usb_uac.o \
+                                            ipmx_usb_quirks.o
 OBJS-$(CONFIG_JACK_INDEV)                += jack.o timefilter.o
 OBJS-$(CONFIG_KMSGRAB_INDEV)             += kmsgrab.o
 OBJS-$(CONFIG_LAVFI_INDEV)               += lavfi.o

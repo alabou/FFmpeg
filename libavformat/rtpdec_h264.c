@@ -318,13 +318,53 @@ static int h264_handle_packet(AVFormatContext *ctx, PayloadContext *data,
     uint8_t nal;
     uint8_t type;
     int result = 0;
+    RTPDemuxContext* s = ctx->parent.d;
+    int cipher_flags = 0;
 
     if (!len) {
         av_log(ctx, AV_LOG_ERROR, "Empty H.264 RTP packet\n");
         return AVERROR_INVALIDDATA;
     }
+
+    #pragma GCC diagnostic ignored "-Wdiscarded-qualifiers"
+
+    if (flags & RTP_FLAG_EXTHDRFULL) cipher_flags |= AVCIPHERCB_VALIDPARAM | AVCIPHERCB_VALIDINPUTCTR;
+
+    if (s && s->privacy_cipher) {
+        if (s->privacy_cipher->callback(s->privacy_cipher->opaque,
+                s->encryption_stream_ctr, s->encryption_input_ctr, buf + 1,
+                len - 1, cipher_flags) < 0) return AVERROR_INVALIDDATA; // in-place
+    }
+    len -= s->privacy_mac_size;
+
+    if (s && s->hdcp_cipher) {
+        if (s->hdcp_cipher->callback(s->hdcp_cipher->opaque,
+                s->encryption_stream_ctr, s->encryption_input_ctr, buf + 1,
+                len - 1, cipher_flags) < 0) return AVERROR_INVALIDDATA; // in-place
+    }
+
+    s->encryption_current_ctr = s->encryption_input_ctr + ((len - 1) & 15) ? ((len - 1) >> 4) + 1 : ((len - 1) >> 4); // once after both encryptions
+
     nal  = buf[0];
     type = nal & 0x1f;
+
+    #if 1 /* Fix synectics corruption */
+        /* Detect corruption at end of packet */
+        if ((len > 8) && (flags & RTP_FLAG_MARKER))
+        {
+            int idx = len - 8;
+            while ((idx + 2) < len)
+            {
+                if ((0x00 == buf[idx + 0])
+                    && (0x00 == buf[idx + 1])
+                    && (0x01 == buf[idx + 2]))
+                {
+                    ((uint8_t *)buf)[idx + 2] = 0x04;
+                }
+                idx ++;
+            }
+        }
+    #endif /* Fix synectics corruption */
 
     /* Simplify the case (these are all the NAL types used internally by
      * the H.264 codec). */

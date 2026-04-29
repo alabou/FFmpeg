@@ -79,6 +79,7 @@ static const AVOption avcodec_options[] = {
 {"noout", "skip bitstream encoding", 0, AV_OPT_TYPE_CONST, {.i64 = AV_CODEC_FLAG2_NO_OUTPUT }, INT_MIN, INT_MAX, V|E, .unit = "flags2"},
 {"ignorecrop", "ignore cropping information from sps", 0, AV_OPT_TYPE_CONST, {.i64 = AV_CODEC_FLAG2_IGNORE_CROP }, INT_MIN, INT_MAX, V|D, .unit = "flags2"},
 {"local_header", "place global headers at every keyframe instead of in extradata", 0, AV_OPT_TYPE_CONST, {.i64 = AV_CODEC_FLAG2_LOCAL_HEADER }, INT_MIN, INT_MAX, V|E, .unit = "flags2"},
+{"extradata", "publish codec sequence headers to extradata regardless of in-band setting", 0, AV_OPT_TYPE_CONST, {.i64 = AV_CODEC_FLAG2_EXTRADATA }, INT_MIN, INT_MAX, V|A|E, .unit = "flags2"},
 {"chunks", "Frame data might be split into multiple chunks", 0, AV_OPT_TYPE_CONST, {.i64 = AV_CODEC_FLAG2_CHUNKS }, INT_MIN, INT_MAX, V|D, .unit = "flags2"},
 {"showall", "Show all frames before the first keyframe", 0, AV_OPT_TYPE_CONST, {.i64 = AV_CODEC_FLAG2_SHOW_ALL }, INT_MIN, INT_MAX, V|D, .unit = "flags2"},
 {"export_mvs", "export motion vectors through frame side data", 0, AV_OPT_TYPE_CONST, {.i64 = AV_CODEC_FLAG2_EXPORT_MVS}, INT_MIN, INT_MAX, V|D, .unit = "flags2"},

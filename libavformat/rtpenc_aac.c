@@ -23,14 +23,17 @@
 #include "avformat.h"
 #include "rtpenc.h"
 
-
+// For AAC encryption we consider that an RTP packet has a FULL ctr unless
+// we are using multiple RTP packets for one access unit.
 void ff_rtp_send_aac(AVFormatContext *s1, const uint8_t *buff, int size)
 {
     RTPMuxContext *s = s1->priv_data;
     AVStream *st = s1->streams[0];
     const int max_au_headers_size = 2 + 2 * s->max_frames_per_packet;
-    int len, max_packet_size = s->max_payload_size - max_au_headers_size;
+    int len, max_packet_size;
     uint8_t *p;
+
+    max_packet_size = s->max_payload_size - max_au_headers_size;
 
     /* skip ADTS header, if present */
     if ((s1->streams[0]->codecpar->extradata_size) == 0) {
@@ -54,6 +57,8 @@ void ff_rtp_send_aac(AVFormatContext *s1, const uint8_t *buff, int size)
         /* Write the AU header size */
         AV_WB16(p, au_size * 8);
 
+        s1->payload_header_size = 2 + s->num_frames * 2;
+        s1->full_ctr = 1;
         ff_rtp_send_data(s1, p, s->buf_ptr - p, 1);
 
         s->num_frames = 0;
@@ -70,17 +75,22 @@ void ff_rtp_send_aac(AVFormatContext *s1, const uint8_t *buff, int size)
         s->buf_ptr += size;
     } else {
         int au_size = size;
+        int n = 0;
 
         max_packet_size = s->max_payload_size - 4;
         p = s->buf;
         AV_WB16(p, 2 * 8);
+        n = 0;
         while (size > 0) {
             len = FFMIN(size, max_packet_size);
             AV_WB16(&p[2], au_size * 8);
             memcpy(p + 4, buff, len);
+            s1->payload_header_size = 2 + 2;
+            s1->full_ctr = (n == 0);
             ff_rtp_send_data(s1, p, len + 4, len == size);
             size -= len;
             buff += len;
+            n += 1;
         }
     }
 }

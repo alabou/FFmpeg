@@ -106,6 +106,16 @@ static const AVOption avformat_options[] = {
 {"skip_estimate_duration_from_pts", "skip duration calculation in estimate_timings_from_pts", OFFSET(skip_estimate_duration_from_pts), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, D},
 {"max_probe_packets", "Maximum number of packets to probe a codec", OFFSET(max_probe_packets), AV_OPT_TYPE_INT, { .i64 = 2500 }, 0, INT_MAX, D },
 {"duration_probesize", "Maximum number of bytes to probe the durations of the streams in estimate_timings_from_pts", OFFSET(duration_probesize), AV_OPT_TYPE_INT64, {.i64 = 0 }, 0, (double)INT64_MAX, D},
+{"hdcp_scramble", "enable dummy HDCP XOR scrambling on RTP streams", OFFSET(hdcp_scramble), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, D|E},
+{"privacy_scramble", "enable dummy privacy XOR scrambling on RTP streams", OFFSET(privacy_scramble), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, D|E},
+{"privacy_encrypt", "enable PEP encryption on RTP streams (TR-10-13)", OFFSET(privacy_encrypt), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, D|E},
+{"pep_psk", "PEP pre-shared key (hex)", OFFSET(pep_psk), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, D|E},
+{"pep_mode", "PEP cipher mode (e.g. AES-128-CTR, AES-256-CTR)", OFFSET(pep_mode), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, D|E},
+{"pep_iv", "PEP base IV (hex, auto-generated if omitted)", OFFSET(pep_iv), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, D|E},
+{"pep_key_generator", "PEP key generator (hex, auto-generated if omitted)", OFFSET(pep_key_generator), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, D|E},
+{"pep_key_version", "PEP initial key version (hex, auto-generated if omitted)", OFFSET(pep_key_version), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, D|E},
+{"pep_rtp_kv", "use RTP_KV dynamic key versioning", OFFSET(pep_rtp_kv), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, D|E},
+{"pep_kv_rotate", "debug: rotate key_version every N frame boundaries (requires pep_rtp_kv)", OFFSET(pep_kv_rotate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, E},
 {NULL},
 };
 

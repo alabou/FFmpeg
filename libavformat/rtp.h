@@ -114,4 +114,44 @@ enum RTCPType {
 
 #define NTP_TO_RTP_FORMAT(x) av_rescale((x), INT64_C(1) << 32, 1000000)
 
+// 20 bytes
+struct RTP_ExtHdrFull {
+
+    uint8_t be;       // 0xBE
+    uint8_t de;       // 0xDE
+    uint8_t length_1; // MSB = 0
+    uint8_t length_0; // LSB = 4
+    uint8_t  l : 4;   // 0xE
+    uint8_t id : 4;
+    uint8_t reserved_2;
+    uint8_t reserved_1;
+    uint8_t reserved_0;
+    uint8_t inband_ctr_3;   // stream_ctr_3 fpr HDCP, key_version_3 for PEP
+    uint8_t inband_ctr_2;   // stream_ctr_2 fpr HDCP, key_version_2 for PEP
+    uint8_t inband_ctr_1;   // stream_ctr_1 fpr HDCP, key_version_1 for PEP
+    uint8_t inband_ctr_0;   // stream_ctr_0 fpr HDCP, key_version_0 for PEP
+    uint8_t input_ctr_7;
+    uint8_t input_ctr_6;
+    uint8_t input_ctr_5;
+    uint8_t input_ctr_4;
+    uint8_t input_ctr_3;
+    uint8_t input_ctr_2;
+    uint8_t input_ctr_1;
+    uint8_t input_ctr_0;
+};
+
+// 8 bytes
+struct RTP_ExtHdrShort {
+
+    uint8_t be;       // 0xBE
+    uint8_t de;       // 0xDE
+    uint8_t length_1; // MSB = 0
+    uint8_t length_0; // LSB = 1
+    uint8_t  l : 4;   // 0x2
+    uint8_t id : 4;
+    uint8_t input_ctr_2;
+    uint8_t input_ctr_1;
+    uint8_t input_ctr_0;
+};
+
 #endif /* AVFORMAT_RTP_H */

@@ -61,6 +61,19 @@ struct RTPMuxContext {
     int flags;
 
     unsigned int frame_count;
+
+    // options for RTPMuxContext
+    struct AVCipherCB * hdcp_cipher;
+    struct AVCipherCB * privacy_cipher;
+
+    // Provided to RTP muxer to program the extended headers. hdcp_context has a duplicate for its own use in the HDCP cipher
+    //
+    uint32_t encryption_stream_ctr; // little endian
+
+    // Initial value 0 provided to RTP muxer to program the extended headers. It increments internally at every slice. This value
+    // cannot reset unless the encryption context values also change in order to provide the expected cipher security.
+    //
+    uint64_t encryption_input_ctr;  // little endian
 };
 
 typedef struct RTPMuxContext RTPMuxContext;
@@ -97,6 +110,7 @@ void ff_rtp_send_vp9(AVFormatContext *s1, const uint8_t *buff, int size);
 void ff_rtp_send_av1(AVFormatContext *s1, const uint8_t *buf1, int size, int is_keyframe);
 void ff_rtp_send_jpeg(AVFormatContext *s1, const uint8_t *buff, int size);
 void ff_rtp_send_raw_rfc4175(AVFormatContext *s1, const uint8_t *buf, int size, int interlaced, int field);
+void ff_rtp_send_am824(AVFormatContext *s1, const uint8_t *buf, int size);
 
 const uint8_t *ff_h263_find_resync_marker_reverse(const uint8_t *restrict start,
                                                   const uint8_t *restrict end);

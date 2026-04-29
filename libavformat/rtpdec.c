@@ -31,9 +31,13 @@
 #include "network.h"
 #include "srtp.h"
 #include "url.h"
+#include "rtp.h"
+#include "rtsp.h"
 #include "rtpdec.h"
 #include "rtpdec_formats.h"
 #include "internal.h"
+#include "rtp_cipher.h"
+#include "rtp_pep.h"
 
 #define MIN_FEEDBACK_INTERVAL 200000 /* 200 ms in us */
 
@@ -75,6 +79,7 @@ extern const RTPDynamicProtocolHandler ff_rdt_live_audio_handler;
 static const RTPDynamicProtocolHandler *const rtp_dynamic_protocol_handler_list[] = {
     /* rtp */
     &ff_ac3_dynamic_handler,
+    &ff_am824_dynamic_handler,
     &ff_amr_nb_dynamic_handler,
     &ff_amr_wb_dynamic_handler,
     &ff_av1_dynamic_handler,
@@ -550,6 +555,88 @@ RTPDemuxContext *ff_rtp_parse_open(AVFormatContext *s1, AVStream *st,
     s->st                  = st;
     s->queue_size          = queue_size;
 
+    if (s1->hdcp_scramble) {
+        if (!s1->video_hdcp_cipher.callback) {
+            s1->video_hdcp_cipher.callback = dummy_xor_hdcp_cipher;
+            s1->video_hdcp_cipher.param = 1;
+        }
+        if (!s1->audio_hdcp_cipher.callback) {
+            s1->audio_hdcp_cipher.callback = dummy_xor_hdcp_cipher;
+            s1->audio_hdcp_cipher.param = 1;
+        }
+        if (!s1->data_hdcp_cipher.callback) {
+            s1->data_hdcp_cipher.callback = dummy_xor_hdcp_cipher;
+            s1->data_hdcp_cipher.param = 1;
+        }
+    }
+
+    if (s1->privacy_encrypt) {
+        if (!s1->video_privacy_cipher.callback) {
+            RtpPepContext *pep_ctx = av_mallocz(sizeof(*pep_ctx));
+            if (pep_ctx && rtp_pep_init(pep_ctx, s1, s1->pep_psk, s1->pep_mode,
+                                        s1->pep_iv, s1->pep_key_generator,
+                                        s1->pep_key_version, s1->pep_rtp_kv) >= 0) {
+                s1->video_privacy_cipher.callback = rtp_pep_cipher_callback;
+                s1->video_privacy_cipher.opaque = pep_ctx;
+                s1->video_privacy_cipher.param = pep_ctx->key_version;
+                s1->audio_privacy_cipher.callback = rtp_pep_cipher_callback;
+                s1->audio_privacy_cipher.opaque = pep_ctx;
+                s1->audio_privacy_cipher.param = pep_ctx->key_version;
+                s1->data_privacy_cipher.callback = rtp_pep_cipher_callback;
+                s1->data_privacy_cipher.opaque = pep_ctx;
+                s1->data_privacy_cipher.param = pep_ctx->key_version;
+                s1->privacy_mac_size = av_ipmx_pep_mode_has_cmac(pep_ctx->mode)
+                                       ? AV_IPMX_PEP_CMAC_TAG_SIZE : 0;
+            } else {
+                av_free(pep_ctx);
+            }
+        }
+    } else if (s1->privacy_scramble) {
+        if (!s1->video_privacy_cipher.callback) {
+            s1->video_privacy_cipher.callback = dummy_xor_privacy_cipher;
+            s1->video_privacy_cipher.param = 1;
+        }
+        if (!s1->audio_privacy_cipher.callback) {
+            s1->audio_privacy_cipher.callback = dummy_xor_privacy_cipher;
+            s1->audio_privacy_cipher.param = 1;
+        }
+        if (!s1->data_privacy_cipher.callback) {
+            s1->data_privacy_cipher.callback = dummy_xor_privacy_cipher;
+            s1->data_privacy_cipher.param = 1;
+        }
+    }
+
+    if (st) {
+        struct AVCipherCB * hdcp_cipher;
+        struct AVCipherCB * privacy_cipher;
+
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            hdcp_cipher = &s1->video_hdcp_cipher;
+            privacy_cipher = &s1->video_privacy_cipher;
+        } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            hdcp_cipher = &s1->audio_hdcp_cipher;
+            privacy_cipher = &s1->audio_privacy_cipher;
+        } else {
+            hdcp_cipher = &s1->data_hdcp_cipher;
+            privacy_cipher = &s1->data_privacy_cipher;
+        }
+
+        if (privacy_cipher && privacy_cipher->callback) {
+            s->privacy_cipher = privacy_cipher;
+            s->encryption_input_ctr = 0;
+            s->encryption_current_ctr = 0;
+            s->encryption_stream_ctr = privacy_cipher->param;
+            s->privacy_mac_size = s1->privacy_mac_size;
+        }
+
+        if (hdcp_cipher && hdcp_cipher->callback) {
+            s->hdcp_cipher = hdcp_cipher;
+            s->encryption_input_ctr = 0;
+            s->encryption_current_ctr = 0;
+            s->encryption_stream_ctr = hdcp_cipher->param;
+        }
+    }
+
     av_log(s->ic, AV_LOG_VERBOSE, "setting jitter buffer size to %d\n",
            s->queue_size);
 
@@ -575,6 +662,7 @@ RTPDemuxContext *ff_rtp_parse_open(AVFormatContext *s1, AVStream *st,
     }
     // needed to send back RTCP RR in RTSP sessions
     gethostname(s->hostname, sizeof(s->hostname));
+
     return s;
 }
 
@@ -685,6 +773,10 @@ static int rtp_parse_packet_internal(RTPDemuxContext *s, AVPacket *pkt,
     AVStream *st;
     uint32_t timestamp;
     int rv = 0;
+    int cipher_flags = 0;
+
+    uint32_t streamCtr = 0; // keyVersion
+    uint64_t inputCtr = 0;
 
     csrc         = buf[0] & 0x0f;
     ext          = buf[0] & 0x10;
@@ -725,6 +817,8 @@ static int rtp_parse_packet_internal(RTPDemuxContext *s, AVPacket *pkt,
     if (len < 0)
         return AVERROR_INVALIDDATA;
 
+    av_log(s->ic, AV_LOG_TRACE, "rtp_recv_data size=%d\n", len);
+
     /* RFC 3550 Section 5.3.1 RTP Header Extension handling */
     if (ext) {
         if (len < 4)
@@ -735,19 +829,125 @@ static int rtp_parse_packet_internal(RTPDemuxContext *s, AVPacket *pkt,
 
         if (len < ext)
             return -1;
+
+        if (s->hdcp_cipher || s->privacy_cipher) {
+
+            // We recognize based on the total length ... we do not know about the SDP transport file ID associated with HDCP or PEP
+            // TODO get the ID from SDP to recognize the HDCP/PEP ones ...
+            if (ext == sizeof(struct RTP_ExtHdrFull)) {
+
+                struct RTP_ExtHdrFull hdr = {0};
+
+                for (int i = 0; i < sizeof(hdr); i++) {
+                    ((uint8_t*)&hdr)[i] = AV_RB8(buf+i);
+                }
+
+                streamCtr = ((uint32_t)hdr.inband_ctr_3 << (3*8)) |
+                            ((uint32_t)hdr.inband_ctr_2 << (2*8)) |
+                            ((uint32_t)hdr.inband_ctr_1 << (1*8)) |
+                            ((uint32_t)hdr.inband_ctr_0 << (0*8));
+
+                s->encryption_stream_ctr = streamCtr; // also used for key_version
+
+                inputCtr  = ((uint64_t)hdr.input_ctr_7 << (7*8)) |
+                            ((uint64_t)hdr.input_ctr_6 << (6*8)) |
+                            ((uint64_t)hdr.input_ctr_5 << (5*8)) |
+                            ((uint64_t)hdr.input_ctr_4 << (4*8)) |
+                            ((uint64_t)hdr.input_ctr_3 << (3*8)) |
+                            ((uint64_t)hdr.input_ctr_2 << (2*8)) |
+                            ((uint64_t)hdr.input_ctr_1 << (1*8)) |
+                            ((uint64_t)hdr.input_ctr_0 << (0*8));
+
+                s->encryption_input_ctr = inputCtr;
+
+                flags |= RTP_FLAG_EXTHDRFULL;
+
+                av_log(s->ic, AV_LOG_TRACE, "rtp_recv_data HDCP/PEP header FULL streamCtr=%d, inputCtr=%ld\n", s->encryption_stream_ctr, s->encryption_input_ctr);
+
+            } else {
+
+                struct RTP_ExtHdrShort hdr = {0};
+
+                for (int i = 0; i < sizeof(hdr); i++) {
+                    ((uint8_t*)&hdr)[i] = AV_RB8(buf+i);
+                }
+
+                inputCtr  = ((uint64_t)hdr.input_ctr_2 << (2*8)) |
+                            ((uint64_t)hdr.input_ctr_1 << (1*8)) |
+                            ((uint64_t)hdr.input_ctr_0 << (0*8));
+
+                if ((s->encryption_input_ctr & 0x0000000000ffffff) < inputCtr) {
+
+                    inputCtr |= (s->encryption_input_ctr & 0xffffffffff000000);
+
+                } else {
+
+                    inputCtr |= (s->encryption_input_ctr & 0xffffffffff000000);
+                    inputCtr += 0x0000000001000000;
+                }
+
+                s->encryption_input_ctr = inputCtr;
+
+                av_log(s->ic, AV_LOG_TRACE, "rtp_recv_data HDCP/PEP header SHORT streamCtr=%d, inputCtr=%ld\n", s->encryption_stream_ctr, s->encryption_input_ctr);
+            }
+
+            if (s->encryption_current_ctr != 0 && s->encryption_input_ctr < s->encryption_current_ctr) {
+                av_log(s->ic, AV_LOG_ERROR, "invalid HDCP/PEP header inputCtr=%ld, currentCtr=%ld\n", s->encryption_input_ctr, s->encryption_current_ctr);
+            }
+        }
+
         // skip past RTP header extension
         len -= ext;
         buf += ext;
+
+        av_log(s->ic, AV_LOG_TRACE, "rtp_recv_data EXTHDR size=%d, payload=%0x%0x%0x%0x\n", ext, buf[0], buf[1], buf[2], buf[3]);
+
+    } else {
+
+        if (s->hdcp_cipher || s->privacy_cipher) {
+            return -1;
+        }
+
+        av_log(s->ic, AV_LOG_TRACE, "rtp_recv_data EXTHDR size=%d, payload=%0x%0x%0x%0x\n", 0, buf[0], buf[1], buf[2], buf[3]);
     }
 
+    // abouchar: handle RTP Payload decryption here for both dynamic or static handlers
     if (s->handler && s->handler->parse_packet) {
+
+        s->ic->parent.d = s;
+
+        // For codec that are dynamic we decrypt on a per-codec basis as we need to know about the RTP Payload Header
         rv = s->handler->parse_packet(s->ic, s->dynamic_protocol_context,
                                       s->st, pkt, &timestamp, buf, len, seq,
                                       flags);
     } else if (st) {
         if ((rv = av_new_packet(pkt, len)) < 0)
             return rv;
+
+        #pragma GCC diagnostic ignored "-Wdiscarded-qualifiers"
+
+        if (flags & RTP_FLAG_EXTHDRFULL) cipher_flags |= AVCIPHERCB_VALIDPARAM | AVCIPHERCB_VALIDINPUTCTR;
+
+        // For codec that are not dynamic there is no payload header and we decrypt here
+        if (s->privacy_cipher) {
+            if (s->privacy_cipher->callback(s->privacy_cipher->opaque,
+                    s->encryption_stream_ctr, s->encryption_input_ctr, buf,
+                    len, cipher_flags) < 0)
+                return AVERROR_INVALIDDATA; // in-place
+            len -= s->privacy_mac_size; /* strip MAC tag (0 for CTR, 8 for CMAC) */
+        }
+
+        if (s->hdcp_cipher) {
+            if (s->hdcp_cipher->callback(s->hdcp_cipher->opaque,
+                    s->encryption_stream_ctr, s->encryption_input_ctr, buf,
+                    len, cipher_flags) < 0)
+                return AVERROR_INVALIDDATA; // in-place
+        }
+
+        s->encryption_current_ctr = s->encryption_input_ctr + ((len - 0) & 15) ? ((len - 0) >> 4) + 1 : ((len - 0) >> 4); // once after both encryptions
+
         memcpy(pkt->data, buf, len);
+        pkt->size = len; /* update size after MAC stripping */
         pkt->stream_index = st->index;
     } else {
         return AVERROR(EINVAL);
@@ -852,6 +1052,9 @@ static int rtp_parse_one_packet(RTPDemuxContext *s, AVPacket *pkt,
             return rtp_parse_queued_packet(s, pkt);
         /* return the next packets, if any */
         if (s->handler && s->handler->parse_packet) {
+
+            s->ic->parent.d = s;
+            
             /* timestamp should be overwritten by parse_packet, if not,
              * the packet is left with pts == AV_NOPTS_VALUE */
             timestamp = RTP_NOTS_VALUE;
@@ -995,3 +1198,4 @@ int ff_rtp_finalize_packet(AVPacket *pkt, AVIOContext **dyn_buf, int stream_idx)
     }
     return pkt->size;
 }
+

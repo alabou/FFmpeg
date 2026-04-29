@@ -126,7 +126,7 @@ int ff_rtp_get_payload_type(const AVFormatContext *fmt,
         }
 
     if (idx < 0)
-        idx = par->codec_type == AVMEDIA_TYPE_AUDIO;
+        idx = 0;
 
     /* dynamic payload type */
     return RTP_PT_PRIVATE + idx;

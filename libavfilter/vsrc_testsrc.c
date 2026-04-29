@@ -90,6 +90,9 @@ typedef struct TestSourceContext {
     /* only used by haldclut */
     int level;
 
+    /* only used by smptehdbars */
+    char *cs;
+
     /* only used by zoneplate */
     int k0, kx, ky, kt;
     int kxt, kyt, kxy;
@@ -1395,6 +1398,16 @@ static const uint8_t rainbowhd[7][4] = {
     {  28, 212, 120, 255 },     /* 75% blue */
 };
 
+static const uint8_t rainbowhd_2020[7][4] = {
+    { 180, 128, 128, 255 },     /* 75% white */
+    { 170,  44, 135, 255 },     /* 75% yellow */
+    { 137, 151,  44, 255 },     /* 75% cyan */
+    { 127,  67,  51, 255 },     /* 75% green */
+    {  69, 189, 205, 255 },     /* 75% magenta */
+    {  59, 105, 212, 255 },     /* 75% red */
+    {  26, 212, 121, 255 },     /* 75% blue */
+};
+
 static const uint8_t wobnair[7][4] = {
     {  35, 212, 114, 255 },     /* 75% blue */
     {  19, 128, 128, 255 },     /* 7.5% intensity black */
@@ -1415,12 +1428,21 @@ static const uint8_t pos4ire[4] = { 24, 128, 128, 255 };
 static const uint8_t i_pixel[4] = { 57, 156,  97, 255 };
 static const uint8_t q_pixel[4] = { 44, 171, 147, 255 };
 
+/* fudged Q/-I for BT.2020 NCL */
+static const uint8_t i_pixel_2020[4] = { 54, 157,  97, 255 };
+static const uint8_t q_pixel_2020[4] = { 45, 170, 148, 255 };
+
 static const uint8_t gray40[4] = { 104, 128, 128, 255 };
 static const uint8_t gray15[4] = {  49, 128, 128, 255 };
 static const uint8_t   cyan[4] = { 188, 154,  16, 255 };
 static const uint8_t yellow[4] = { 219,  16, 138, 255 };
 static const uint8_t   blue[4] = {  32, 240, 118, 255 };
 static const uint8_t    red[4] = {  63, 102, 240, 255 };
+
+static const uint8_t   cyan_2020[4] = { 177, 160,  16, 255 };
+static const uint8_t yellow_2020[4] = { 222,  16, 137, 255 };
+static const uint8_t   blue_2020[4] = {  29, 240, 119, 255 };
+static const uint8_t    red_2020[4] = {  74,  96, 240, 255 };
 static const uint8_t black0[4] = {  16, 128, 128, 255 };
 static const uint8_t black2[4] = {  20, 128, 128, 255 };
 static const uint8_t black4[4] = {  25, 128, 128, 255 };
@@ -1646,11 +1668,30 @@ const FFFilter ff_vsrc_smptebars = {
 
 #if CONFIG_SMPTEHDBARS_FILTER
 
+static const AVOption smptehdbars_options[] = {
+    COMMON_OPTIONS
+    { "cs", "set colorspace", OFFSET(cs), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
+    { NULL }
+};
+
+AVFILTER_DEFINE_CLASS(smptehdbars);
+
 static void smptehdbars_fill_picture(AVFilterContext *ctx, AVFrame *picref)
 {
     TestSourceContext *test = ctx->priv;
     int d_w, r_w, r_h, l_w, i, tmp, x = 0, y = 0;
     const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(picref->format);
+    const int bt2020 = test->cs && !strcmp(test->cs, "bt2020");
+    const uint8_t (*bars)[4] = bt2020 ? rainbowhd_2020 : rainbowhd;
+
+    if (bt2020) {
+        picref->colorspace      = AVCOL_SPC_BT2020_NCL;
+        picref->color_primaries = AVCOL_PRI_BT2020;
+        picref->color_trc       = AVCOL_TRC_BT709;
+        picref->color_range     = AVCOL_RANGE_MPEG;
+    } else {
+        picref->colorspace = AVCOL_SPC_BT709;
+    }
 
     d_w = FFALIGN(test->w / 8, 1 << pixdesc->log2_chroma_w);
     r_h = FFALIGN(test->h * 7 / 12, 1 << pixdesc->log2_chroma_h);
@@ -1659,25 +1700,25 @@ static void smptehdbars_fill_picture(AVFilterContext *ctx, AVFrame *picref)
 
     r_w = FFALIGN((((test->w + 3) / 4) * 3) / 7, 1 << pixdesc->log2_chroma_w);
     for (i = 0; i < 7; i++) {
-        draw_bar(test, rainbowhd[i], x, 0, r_w, r_h, picref);
+        draw_bar(test, bars[i], x, 0, r_w, r_h, picref);
         x += r_w;
     }
     draw_bar(test, gray40, x, 0, test->w - x, r_h, picref);
     y = r_h;
     r_h = FFALIGN(test->h / 12, 1 << pixdesc->log2_chroma_h);
-    draw_bar(test, cyan, 0, y, d_w, r_h, picref);
+    draw_bar(test, bt2020 ? cyan_2020 : cyan, 0, y, d_w, r_h, picref);
     x = d_w;
-    draw_bar(test, i_pixel, x, y, r_w, r_h, picref);
+    draw_bar(test, bt2020 ? i_pixel_2020 : i_pixel, x, y, r_w, r_h, picref);
     x += r_w;
     tmp = r_w * 6;
-    draw_bar(test, rainbowhd[0], x, y, tmp, r_h, picref);
+    draw_bar(test, bars[0], x, y, tmp, r_h, picref);
     x += tmp;
     l_w = x;
-    draw_bar(test, blue, x, y, test->w - x, r_h, picref);
+    draw_bar(test, bt2020 ? blue_2020 : blue, x, y, test->w - x, r_h, picref);
     y += r_h;
-    draw_bar(test, yellow, 0, y, d_w, r_h, picref);
+    draw_bar(test, bt2020 ? yellow_2020 : yellow, 0, y, d_w, r_h, picref);
     x = d_w;
-    draw_bar(test, q_pixel, x, y, r_w, r_h, picref);
+    draw_bar(test, bt2020 ? q_pixel_2020 : q_pixel, x, y, r_w, r_h, picref);
     x += r_w;
 
     for (i = 0; i < tmp; i += 1 << pixdesc->log2_chroma_w) {
@@ -1691,7 +1732,7 @@ static void smptehdbars_fill_picture(AVFilterContext *ctx, AVFrame *picref)
         draw_bar(test, yramp, x, y, 1 << pixdesc->log2_chroma_w, r_h, picref);
         x += 1 << pixdesc->log2_chroma_w;
     }
-    draw_bar(test, red, x, y, test->w - x, r_h, picref);
+    draw_bar(test, bt2020 ? red_2020 : red, x, y, test->w - x, r_h, picref);
     y += r_h;
     draw_bar(test, gray15, 0, y, d_w, test->h - y, picref);
     x = d_w;
@@ -1733,7 +1774,7 @@ static av_cold int smptehdbars_init(AVFilterContext *ctx)
 const FFFilter ff_vsrc_smptehdbars = {
     .p.name        = "smptehdbars",
     .p.description = NULL_IF_CONFIG_SMALL("Generate SMPTE HD color bars."),
-    .p.priv_class  = &smptebars_class,
+    .p.priv_class  = &smptehdbars_class,
     .priv_size     = sizeof(TestSourceContext),
     .init          = smptehdbars_init,
     .uninit        = uninit,

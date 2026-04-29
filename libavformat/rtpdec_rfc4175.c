@@ -130,7 +130,7 @@ static int rfc4175_parse_fmtp(AVFormatContext *s, AVStream *stream,
         data->width = atoi(value);
     else if (!strncmp(attr, "height", 6))
         data->height = atoi(value);
-    else if (data->sampling == NULL && !strncmp(attr, "sampling", 8))
+    else if (!strncmp(attr, "sampling", 8))
         data->sampling = av_strdup(value);
     else if (!strncmp(attr, "depth", 5))
         data->depth = atoi(value);
@@ -174,39 +174,30 @@ static int rfc4175_parse_fmtp(AVFormatContext *s, AVStream *stream,
 }
 
 static int rfc4175_parse_sdp_line(AVFormatContext *s, int st_index,
-                                  PayloadContext *data_arg, const char *line)
+                                  PayloadContext *data, const char *line)
 {
     const char *p;
 
     if (st_index < 0)
         return 0;
 
-    av_assert0(!data_arg->sampling);
-
     if (av_strstart(line, "fmtp:", &p)) {
         AVStream *stream = s->streams[st_index];
-        PayloadContext data0 = *data_arg, *data = &data0;
         int ret = ff_parse_fmtp(s, stream, data, p, rfc4175_parse_fmtp);
 
+        if (ret < 0)
+            return ret;
+
+
         if (!data->sampling || !data->depth || !data->width || !data->height)
-            ret =  AVERROR(EINVAL);
-
-        if (ret < 0)
-            goto fail;
-
-        ret = av_image_check_size(data->width, data->height, 0, s);
-        if (ret < 0)
-            goto fail;
+            return AVERROR(EINVAL);
 
         stream->codecpar->width = data->width;
         stream->codecpar->height = data->height;
 
         ret = rfc4175_parse_format(stream, data);
         av_freep(&data->sampling);
-        if (ret >= 0)
-            *data_arg = *data;
-fail:
-        av_freep(&data->sampling);
+
         return ret;
     }
 
@@ -242,6 +233,8 @@ static int rfc4175_handle_packet(AVFormatContext *ctx, PayloadContext *data,
     const uint8_t *payload = buf + 2;
     int payload_len = len - 2;
     int missed_last_packet = 0;
+    RTPDemuxContext* s = ctx->parent.d;
+    int cipher_flags = 0;
 
     uint8_t *dest;
 
@@ -283,6 +276,27 @@ static int rfc4175_handle_packet(AVFormatContext *ctx, PayloadContext *data,
         payload_len -= 6;
     } while (cont);
 
+    #pragma GCC diagnostic ignored "-Wdiscarded-qualifiers"
+
+    if (flags & RTP_FLAG_EXTHDRFULL) cipher_flags |= AVCIPHERCB_VALIDPARAM | AVCIPHERCB_VALIDINPUTCTR;
+
+    if (s && s->privacy_cipher) {
+        if (s->privacy_cipher->callback(s->privacy_cipher->opaque,
+                s->encryption_stream_ctr, s->encryption_input_ctr, payload,
+                payload_len, cipher_flags) < 0)
+            return AVERROR_INVALIDDATA; // in-place
+    }
+    payload_len -= s->privacy_mac_size;
+
+    if (s && s->hdcp_cipher) {
+        if (s->hdcp_cipher->callback(s->hdcp_cipher->opaque,
+                s->encryption_stream_ctr, s->encryption_input_ctr, payload,
+                payload_len, cipher_flags) < 0)
+            return AVERROR_INVALIDDATA; // in-place
+    }
+
+    s->encryption_current_ctr = s->encryption_input_ctr + ((payload_len - 0) & 15) ? ((payload_len - 0) >> 4) + 1 : ((payload_len - 0) >> 4); // once after both encryptions
+
     /* and now iterate over every scan lines */
     do {
         int copy_offset;
@@ -306,9 +320,6 @@ static int rfc4175_handle_packet(AVFormatContext *ctx, PayloadContext *data,
 
         if (data->interlaced)
             line = 2 * line + field;
-
-        if (line >= data->height)
-            return AVERROR_INVALIDDATA;
 
         /* prevent ill-formed packets to write after buffer's end */
         copy_offset = (line * data->width + offset) * data->pgroup / data->xinc;

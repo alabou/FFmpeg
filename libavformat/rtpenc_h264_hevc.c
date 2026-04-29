@@ -57,9 +57,16 @@ static void nal_send(AVFormatContext *s1, const uint8_t *buf, int size, int last
 {
     RTPMuxContext *s = s1->priv_data;
     enum AVCodecID codec = s1->streams[0]->codecpar->codec_id;
+    int n = 0;
+
+    if (codec == AV_CODEC_ID_H264) {
+        s1->payload_header_size = 1;
+    } else {
+        s1->payload_header_size = 2;
+    }
 
     av_log(s1, AV_LOG_DEBUG, "Sending NAL %x of len %d M=%d\n", buf[0] & 0x1F, size, last);
-    if (size <= s->max_payload_size) {
+    if (size <= s->max_payload_size) { // use worse case here
         int buffered_size = s->buf_ptr - s->buf;
         int header_size;
         int skip_aggregate = 0;
@@ -73,6 +80,7 @@ static void nal_send(AVFormatContext *s1, const uint8_t *buf, int size, int last
 
         // Flush buffered NAL units if the current unit doesn't fit
         if (buffered_size + 2 + size > s->max_payload_size) {
+            s1->full_ctr = 1;
             flush_buffered(s1, 0);
             buffered_size = 0;
         }
@@ -96,11 +104,15 @@ static void nal_send(AVFormatContext *s1, const uint8_t *buf, int size, int last
             s->buf_ptr += size;
             s->buffered_nals++;
         } else {
+            s1->full_ctr = 1;
             flush_buffered(s1, 0);
-            ff_rtp_send_data(s1, buf, size, last);
+            s1->full_ctr = 1; // aggregated NALU
+            memcpy(s->buf, buf, size);
+            ff_rtp_send_data(s1, s->buf, size, last);
         }
     } else {
-        int flag_byte, header_size;
+        int flag_byte, header_size, flag_value;
+        s1->full_ctr = 1;
         flush_buffered(s1, 0);
         if (codec == AV_CODEC_ID_H264 && (s->flags & FF_RTP_FLAG_H264_MODE0)) {
             av_log(s1, AV_LOG_ERROR,
@@ -121,6 +133,7 @@ static void nal_send(AVFormatContext *s1, const uint8_t *buf, int size, int last
             size -= 1;
 
             flag_byte   = 1;
+            flag_value  = s->buf[1];
             header_size = 2;
         } else {
             uint8_t nal_type = (buf[0] >> 1) & 0x3F;
@@ -162,18 +175,25 @@ static void nal_send(AVFormatContext *s1, const uint8_t *buf, int size, int last
             size -= 2;
 
             flag_byte   = 2;
+            flag_value  = s->buf[2];
             header_size = 3;
         }
 
+        n = 0;
         while (size + header_size > s->max_payload_size) {
             memcpy(&s->buf[header_size], buf, s->max_payload_size - header_size);
+            s1->full_ctr = (n == 0);
             ff_rtp_send_data(s1, s->buf, s->max_payload_size, 0);
             buf  += s->max_payload_size - header_size;
             size -= s->max_payload_size - header_size;
-            s->buf[flag_byte] &= ~(1 << 7);
+            flag_value &= ~(1 << 7);
+            s->buf[flag_byte] = flag_value;
+            n += 1;
         }
-        s->buf[flag_byte] |= 1 << 6;
+        flag_value |= 1 << 6;
+        s->buf[flag_byte] = flag_value;
         memcpy(&s->buf[header_size], buf, size);
+        s1->full_ctr = (n == 0);
         ff_rtp_send_data(s1, s->buf, size + header_size, last);
     }
 }
@@ -196,9 +216,6 @@ void ff_rtp_send_h264_hevc(AVFormatContext *s1, const uint8_t *buf1, int size)
             r1 = ff_nal_mp4_find_startcode(r, end, s->nal_length_size);
             if (!r1)
                 r1 = end;
-            // Check that the last is not truncated
-            if (r1 - r < s->nal_length_size)
-                break;
             r += s->nal_length_size;
         } else {
             while (!*(r++));
@@ -207,5 +224,6 @@ void ff_rtp_send_h264_hevc(AVFormatContext *s1, const uint8_t *buf1, int size)
         nal_send(s1, r, r1 - r, r1 == end);
         r = r1;
     }
+    s1->full_ctr = 1;
     flush_buffered(s1, 1);
 }

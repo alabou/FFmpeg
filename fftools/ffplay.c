@@ -59,6 +59,10 @@
 #include "ffplay_renderer.h"
 #include "opt_common.h"
 
+/* IPMX pipeline timing — activated by IPMX_TIMING=1 env var */
+#include "libavutil/buffer.h"
+#include "libavdevice/ipmx_timing.h"
+
 const char program_name[] = "ffplay";
 const int program_birth_year = 2003;
 
@@ -71,6 +75,7 @@ const int program_birth_year = 2003;
 #define SDL_AUDIO_MIN_BUFFER_SIZE 512
 /* Calculate actual buffer size keeping in mind not cause too frequent audio callbacks */
 #define SDL_AUDIO_MAX_CALLBACKS_PER_SEC 30
+#define SDL_AUDIO_MAX_CALLBACKS_PER_SEC_LOWLATENCY 60
 
 /* Step size for volume control in dB */
 #define SDL_VOLUME_STEP (0.75)
@@ -147,6 +152,7 @@ typedef struct Clock {
 
 typedef struct FrameData {
     int64_t pkt_pos;
+    int64_t timing_us;   /* IPMX receive-time wall-clock (µs), 0 if unset */
 } FrameData;
 
 /* Common struct for handling all types of decoded data and allocated render buffers. */
@@ -348,6 +354,7 @@ static const char **vfilters_list = NULL;
 static int nb_vfilters = 0;
 static char *afilters = NULL;
 static int autorotate = 1;
+static int lowlatency = 0;
 static int find_stream_info = 1;
 static int filter_nbthreads = 0;
 static int enable_vulkan = 0;
@@ -358,6 +365,80 @@ static const char *hwaccel = NULL;
 /* current context */
 static int is_full_screen;
 static int64_t audio_callback_time;
+
+/* IPMX timing instrumentation globals */
+static FILE *ipmx_timing_fp;
+static int64_t ipmx_timing_vid_show_cnt;
+static int64_t ipmx_timing_vid_drop_early_cnt;
+static int64_t ipmx_timing_vid_drop_late_cnt;
+static int64_t ipmx_timing_aud_play_cnt;
+static int64_t ipmx_timing_aud_starve_cnt;
+static int64_t ipmx_timing_aud_sync_cnt;
+
+/*
+ * Real E2E latency tracking (sender_us → display/playback wall clock).
+ * Updated at VID_SHOW and AUD_PLAY, displayed on the status line.
+ * Rolling window: reset every STATUS_INTERVAL so numbers reflect recent state.
+ */
+#define E2E_STATUS_INTERVAL_US 3000000  /* 3 s */
+static double   e2e_vid_sum;
+static int64_t  e2e_vid_count;
+static double   e2e_vid_mean_ms;        /* last computed mean (survives reset) */
+static double   e2e_aud_sum;
+static int64_t  e2e_aud_count;
+static double   e2e_aud_mean_ms;
+static int64_t  e2e_last_reset_us;
+static int      e2e_active;              /* set once we see a valid sender_us */
+
+static inline int64_t e2e_read_sender_us(const AVFrame *frame)
+{
+    if (frame && frame->opaque_ref &&
+        frame->opaque_ref->size >= (int)sizeof(IpmxTimingOpaque)) {
+        const IpmxTimingOpaque *t =
+            (const IpmxTimingOpaque *)frame->opaque_ref->data;
+        return t->sender_us;
+    }
+    return 0;
+}
+
+static inline void e2e_update(int is_audio, int64_t sender_us)
+{
+    int64_t now_us, latency_us;
+    if (sender_us <= 0 || !av_ipmx_clockrec_stats.calibrated)
+        return;
+
+    /* With the affine clock model, sender_us is already in receiver
+     * wall-clock domain (â·s + b̂).  E2E latency is simply now - sender_us.
+     * No clock_offset addition needed — the offset is baked into b̂. */
+    now_us = av_gettime_relative();
+    latency_us = now_us - sender_us;
+    if (latency_us < 0 || latency_us > 10000000)
+        return;
+
+    if (!e2e_active)
+        e2e_active = 1;
+
+    if (is_audio) {
+        e2e_aud_sum += (double)latency_us;
+        e2e_aud_count++;
+    } else {
+        e2e_vid_sum += (double)latency_us;
+        e2e_vid_count++;
+    }
+
+    if (!e2e_last_reset_us)
+        e2e_last_reset_us = now_us;
+
+    if (now_us - e2e_last_reset_us >= E2E_STATUS_INTERVAL_US) {
+        if (e2e_vid_count > 0)
+            e2e_vid_mean_ms = (e2e_vid_sum / (double)e2e_vid_count) / 1000.0;
+        if (e2e_aud_count > 0)
+            e2e_aud_mean_ms = (e2e_aud_sum / (double)e2e_aud_count) / 1000.0;
+        e2e_vid_sum = e2e_vid_count = 0;
+        e2e_aud_sum = e2e_aud_count = 0;
+        e2e_last_reset_us = now_us;
+    }
+}
 
 #define FF_QUIT_EVENT    (SDL_USEREVENT + 2)
 
@@ -1343,11 +1424,31 @@ static void stream_close(VideoState *is)
     av_free(is);
 }
 
+static void ipmx_timing_close(void)
+{
+    if (!ipmx_timing_fp)
+        return;
+    fprintf(ipmx_timing_fp,
+            "%lld\tSUMMARY\t-\t-\t-\t"
+            "vid_show=%lld:vid_drop_early=%lld:vid_drop_late=%lld:"
+            "aud_play=%lld:aud_starve=%lld:aud_sync=%lld\n",
+            (long long)av_gettime_relative(),
+            (long long)ipmx_timing_vid_show_cnt,
+            (long long)ipmx_timing_vid_drop_early_cnt,
+            (long long)ipmx_timing_vid_drop_late_cnt,
+            (long long)ipmx_timing_aud_play_cnt,
+            (long long)ipmx_timing_aud_starve_cnt,
+            (long long)ipmx_timing_aud_sync_cnt);
+    fclose(ipmx_timing_fp);
+    ipmx_timing_fp = NULL;
+}
+
 static void do_exit(VideoState *is)
 {
     if (is) {
         stream_close(is);
     }
+    ipmx_timing_close();
     if (renderer)
         SDL_DestroyRenderer(renderer);
     if (vk_renderer)
@@ -1670,17 +1771,23 @@ retry:
 
             /* compute nominal last_duration */
             last_duration = vp_duration(is, lastvp, vp);
-            delay = compute_target_delay(last_duration, is);
+            time = av_gettime_relative() / 1000000.0;
 
-            time= av_gettime_relative()/1000000.0;
-            if (time < is->frame_timer + delay) {
-                *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
-                goto display;
-            }
-
-            is->frame_timer += delay;
-            if (delay > 0 && time - is->frame_timer > AV_SYNC_THRESHOLD_MAX)
+            if (lowlatency) {
+                delay = 0;
                 is->frame_timer = time;
+            } else {
+                delay = compute_target_delay(last_duration, is);
+
+                if (time < is->frame_timer + delay) {
+                    *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
+                    goto display;
+                }
+
+                is->frame_timer += delay;
+                if (delay > 0 && time - is->frame_timer > AV_SYNC_THRESHOLD_MAX)
+                    is->frame_timer = time;
+            }
 
             SDL_LockMutex(is->pictq.mutex);
             if (!isnan(vp->pts))
@@ -1691,6 +1798,17 @@ retry:
                 Frame *nextvp = frame_queue_peek_next(&is->pictq);
                 duration = vp_duration(is, vp, nextvp);
                 if(!is->step && (framedrop>0 || (framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) && time > is->frame_timer + duration){
+                    if (ipmx_timing_fp) {
+                        FrameData *fd2 = vp->frame && vp->frame->opaque_ref ?
+                            (FrameData *)vp->frame->opaque_ref->data : NULL;
+                        fprintf(ipmx_timing_fp,
+                                "%lld\tVID_DROP_LATE\tV\t%lld\t%lld\t%.3f:%d\n",
+                                (long long)av_gettime_relative(),
+                                (long long)ipmx_timing_vid_drop_late_cnt++,
+                                (long long)(fd2 ? fd2->timing_us : 0),
+                                (time - is->frame_timer) * 1000.0,
+                                frame_queue_nb_remaining(&is->pictq));
+                    }
                     is->frame_drops_late++;
                     frame_queue_next(&is->pictq);
                     goto retry;
@@ -1729,6 +1847,25 @@ retry:
                         break;
                     }
                 }
+            }
+
+            e2e_update(0, e2e_read_sender_us(vp->frame));
+
+            if (ipmx_timing_fp) {
+                FrameData *fd = (vp->frame && vp->frame->opaque_ref) ?
+                    (FrameData *)vp->frame->opaque_ref->data : NULL;
+                double av_diff = 0;
+                if (is->audio_st)
+                    av_diff = get_clock(&is->vidclk) - get_clock(&is->audclk);
+                fprintf(ipmx_timing_fp,
+                        "%lld\tVID_SHOW\tV\t%lld\t%lld\t%.3f:%.3f:%d:pts=%lld\n",
+                        (long long)av_gettime_relative(),
+                        (long long)ipmx_timing_vid_show_cnt++,
+                        (long long)(fd ? fd->timing_us : 0),
+                        av_diff * 1000.0,
+                        delay * 1000.0,
+                        frame_queue_nb_remaining(&is->pictq),
+                        (long long)(vp->pts * 1000000));
             }
 
             frame_queue_next(&is->pictq);
@@ -1771,7 +1908,7 @@ display:
 
             av_bprint_init(&buf, 0, AV_BPRINT_SIZE_AUTOMATIC);
             av_bprintf(&buf,
-                      "%7.2f %s:%7.3f fd=%4d aq=%5dKB vq=%5dKB sq=%5dB \r",
+                      "%7.2f %s:%7.3f fd=%4d aq=%5dKB vq=%5dKB sq=%5dB",
                       get_master_clock(is),
                       (is->audio_st && is->video_st) ? "A-V" : (is->video_st ? "M-V" : (is->audio_st ? "M-A" : "   ")),
                       av_diff,
@@ -1779,6 +1916,19 @@ display:
                       aqsize / 1024,
                       vqsize / 1024,
                       sqsize);
+
+            if (e2e_active || av_ipmx_clockrec_stats.calibrated) {
+                av_bprintf(&buf, " |");
+                if (e2e_active)
+                    av_bprintf(&buf, " e2e_v=%.1fms e2e_a=%.1fms",
+                               e2e_vid_mean_ms, e2e_aud_mean_ms);
+                if (av_ipmx_clockrec_stats.calibrated)
+                    av_bprintf(&buf, " skip=%lld rep=%lld drift=%+.1fppm",
+                               (long long)av_ipmx_clockrec_stats.video_skipped,
+                               (long long)av_ipmx_clockrec_stats.video_repeated,
+                               av_ipmx_clockrec_stats.drift_ppm);
+            }
+            av_bprintf(&buf, "   \r");
 
             if (show_status == 1 && AV_LOG_INFO > av_log_get_level())
                 fprintf(stderr, "%s", buf.str);
@@ -1846,6 +1996,16 @@ static int get_video_frame(VideoState *is, AVFrame *frame)
                     diff - is->frame_last_filter_delay < 0 &&
                     is->viddec.pkt_serial == is->vidclk.serial &&
                     is->videoq.nb_packets) {
+                    if (ipmx_timing_fp) {
+                        FrameData *fd2 = frame->opaque_ref ?
+                            (FrameData *)frame->opaque_ref->data : NULL;
+                        fprintf(ipmx_timing_fp,
+                                "%lld\tVID_DROP_EARLY\tV\t%lld\t%lld\t%.3f\n",
+                                (long long)av_gettime_relative(),
+                                (long long)ipmx_timing_vid_drop_early_cnt++,
+                                (long long)(fd2 ? fd2->timing_us : 0),
+                                diff * 1000.0);
+                    }
                     is->frame_drops_early++;
                     av_frame_unref(frame);
                     got_picture = 0;
@@ -2442,11 +2602,36 @@ static int audio_decode_frame(VideoState *is)
         frame_queue_next(&is->sampq);
     } while (af->serial != is->audioq.serial);
 
+    e2e_update(1, e2e_read_sender_us(af->frame));
+
+    if (ipmx_timing_fp) {
+        FrameData *fd = (af->frame && af->frame->opaque_ref) ?
+            (FrameData *)af->frame->opaque_ref->data : NULL;
+        fprintf(ipmx_timing_fp,
+                "%lld\tAUD_PLAY\tA\t%lld\t%lld\t%d:%d:pts=%lld\n",
+                (long long)av_gettime_relative(),
+                (long long)ipmx_timing_aud_play_cnt++,
+                (long long)(fd ? fd->timing_us : 0),
+                frame_queue_nb_remaining(&is->sampq),
+                af->frame ? af->frame->nb_samples : 0,
+                (long long)(af->pts * 1000000));
+    }
+
     data_size = av_samples_get_buffer_size(NULL, af->frame->ch_layout.nb_channels,
                                            af->frame->nb_samples,
                                            af->frame->format, 1);
 
     wanted_nb_samples = synchronize_audio(is, af->frame->nb_samples);
+
+    if (ipmx_timing_fp && wanted_nb_samples != af->frame->nb_samples) {
+        double diff = get_clock(&is->audclk) - get_master_clock(is);
+        fprintf(ipmx_timing_fp,
+                "%lld\tAUD_SYNC\tA\t%lld\t-\t%.3f:%d\n",
+                (long long)av_gettime_relative(),
+                (long long)ipmx_timing_aud_sync_cnt++,
+                diff * 1000.0,
+                wanted_nb_samples - af->frame->nb_samples);
+    }
 
     if (af->frame->format        != is->audio_src.fmt            ||
         av_channel_layout_compare(&af->frame->ch_layout, &is->audio_src.ch_layout) ||
@@ -2541,6 +2726,12 @@ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
            audio_size = audio_decode_frame(is);
            if (audio_size < 0) {
                 /* if error, just output silence */
+               if (ipmx_timing_fp)
+                   fprintf(ipmx_timing_fp,
+                           "%lld\tAUD_STARVE\tA\t%lld\t-\t%d\n",
+                           (long long)av_gettime_relative(),
+                           (long long)ipmx_timing_aud_starve_cnt++,
+                           frame_queue_nb_remaining(&is->sampq));
                is->audio_buf = NULL;
                is->audio_buf_size = SDL_AUDIO_MIN_BUFFER_SIZE / is->audio_tgt.frame_size * is->audio_tgt.frame_size;
            } else {
@@ -2602,7 +2793,8 @@ static int audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int 
         next_sample_rate_idx--;
     wanted_spec.format = AUDIO_S16SYS;
     wanted_spec.silence = 0;
-    wanted_spec.samples = FFMAX(SDL_AUDIO_MIN_BUFFER_SIZE, 2 << av_log2(wanted_spec.freq / SDL_AUDIO_MAX_CALLBACKS_PER_SEC));
+    wanted_spec.samples = FFMAX(SDL_AUDIO_MIN_BUFFER_SIZE, 2 << av_log2(wanted_spec.freq /
+        (lowlatency ? SDL_AUDIO_MAX_CALLBACKS_PER_SEC_LOWLATENCY : SDL_AUDIO_MAX_CALLBACKS_PER_SEC)));
     wanted_spec.callback = sdl_audio_callback;
     wanted_spec.userdata = opaque;
     while (!(audio_dev = SDL_OpenAudioDevice(NULL, 0, &wanted_spec, &spec, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_CHANNELS_CHANGE))) {
@@ -2811,6 +3003,13 @@ static int stream_component_open(VideoState *is, int stream_index)
         if ((ret = decoder_start(&is->auddec, audio_thread, "audio_decoder", is)) < 0)
             goto out;
         SDL_PauseAudioDevice(audio_dev, 0);
+        if (ipmx_timing_fp)
+            fprintf(ipmx_timing_fp,
+                    "%lld\tAUD_OPEN\tA\t-\t-\t%d:%d:%d\n",
+                    (long long)av_gettime_relative(),
+                    is->audio_tgt.freq,
+                    is->audio_tgt.ch_layout.nb_channels,
+                    is->audio_hw_buf_size);
         break;
     case AVMEDIA_TYPE_VIDEO:
         is->video_stream = stream_index;
@@ -2821,6 +3020,16 @@ static int stream_component_open(VideoState *is, int stream_index)
         if ((ret = decoder_start(&is->viddec, video_thread, "video_decoder", is)) < 0)
             goto out;
         is->queue_attachments_req = 1;
+        if (ipmx_timing_fp) {
+            AVRational fps = is->video_st->avg_frame_rate;
+            if (!fps.num || !fps.den)
+                fps = is->video_st->r_frame_rate;
+            fprintf(ipmx_timing_fp,
+                    "%lld\tVID_OPEN\tV\t-\t-\t%dx%d:%d/%d\n",
+                    (long long)av_gettime_relative(),
+                    avctx->width, avctx->height,
+                    fps.num, fps.den);
+        }
         break;
     case AVMEDIA_TYPE_SUBTITLE:
         is->subtitle_stream = stream_index;
@@ -2932,6 +3141,30 @@ static int read_thread(void *arg)
         goto fail;
     is->ic = ic;
 
+    if (!ipmx_timing_fp) {
+        const char *env = getenv("IPMX_TIMING");
+        if (env && env[0] == '1') {
+            ipmx_timing_fp = fopen("/tmp/ipmx_timing_ffplay.log", "w");
+            if (ipmx_timing_fp) {
+                atexit(ipmx_timing_close);
+                setvbuf(ipmx_timing_fp, NULL, _IOLBF, 0);
+                fprintf(ipmx_timing_fp,
+                        "# wall_us\tevent\tmedia\tcounter\tref_us\textra\n"
+                        "# Events: VID_SHOW VID_DROP_EARLY VID_DROP_LATE "
+                        "AUD_PLAY AUD_STARVE AUD_SYNC AUD_OPEN VID_OPEN "
+                        "PROBE_START PROBE_END\n"
+                        "# VID_SHOW  extra = av_diff_ms:delay_ms:pictq\n"
+                        "# VID_DROP_EARLY extra = diff_ms\n"
+                        "# VID_DROP_LATE  extra = diff_ms:pictq\n"
+                        "# AUD_PLAY  extra = sampq:nb_samples\n"
+                        "# AUD_STARVE extra = sampq\n"
+                        "# AUD_SYNC  extra = diff_ms:delta_samples\n"
+                        "# AUD_OPEN  extra = rate:ch:bufsize\n"
+                        "# VID_OPEN  extra = WxH:fps_num/fps_den\n");
+            }
+        }
+    }
+
     if (genpts)
         ic->flags |= AVFMT_FLAG_GENPTS;
 
@@ -2947,7 +3180,17 @@ static int read_thread(void *arg)
             goto fail;
         }
 
+        if (ipmx_timing_fp)
+            fprintf(ipmx_timing_fp,
+                    "%lld\tPROBE_START\t-\t-\t-\t-\n",
+                    (long long)av_gettime_relative());
+
         err = avformat_find_stream_info(ic, opts);
+
+        if (ipmx_timing_fp)
+            fprintf(ipmx_timing_fp,
+                    "%lld\tPROBE_END\t-\t-\t-\t-\n",
+                    (long long)av_gettime_relative());
 
         for (i = 0; i < orig_nb_streams; i++)
             av_dict_free(&opts[i]);
@@ -3168,7 +3411,7 @@ static int read_thread(void *arg)
                     break;
             }
             SDL_LockMutex(wait_mutex);
-            SDL_CondWaitTimeout(is->continue_read_thread, wait_mutex, 10);
+            SDL_CondWaitTimeout(is->continue_read_thread, wait_mutex, 5);
             SDL_UnlockMutex(wait_mutex);
             continue;
         } else {
@@ -3243,7 +3486,8 @@ static VideoState *stream_open(const char *filename,
     is->xleft   = 0;
 
     /* start video display */
-    if (frame_queue_init(&is->pictq, &is->videoq, VIDEO_PICTURE_QUEUE_SIZE, 1) < 0)
+    if (frame_queue_init(&is->pictq, &is->videoq,
+                         lowlatency ? 2 : VIDEO_PICTURE_QUEUE_SIZE, 1) < 0)
         goto fail;
     if (frame_queue_init(&is->subpq, &is->subtitleq, SUBPICTURE_QUEUE_SIZE, 0) < 0)
         goto fail;
@@ -3392,6 +3636,7 @@ static void toggle_audio_display(VideoState *is)
 
 static void refresh_loop_wait_event(VideoState *is, SDL_Event *event) {
     double remaining_time = 0.0;
+    const double refresh_rate = lowlatency ? 0.003 : REFRESH_RATE;
     SDL_PumpEvents();
     while (!SDL_PeepEvents(event, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT)) {
         if (!cursor_hidden && av_gettime_relative() - cursor_last_shown > CURSOR_HIDE_DELAY) {
@@ -3400,7 +3645,7 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event) {
         }
         if (remaining_time > 0.0)
             av_usleep((int64_t)(remaining_time * 1000000.0));
-        remaining_time = REFRESH_RATE;
+        remaining_time = refresh_rate;
         if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh))
             video_refresh(is, &remaining_time);
         SDL_PumpEvents();
@@ -3786,6 +4031,7 @@ static const OptionDef options[] = {
     { "scodec",             OPT_TYPE_STRING, OPT_EXPERT, { &subtitle_codec_name }, "force subtitle decoder", "decoder_name" },
     { "vcodec",             OPT_TYPE_STRING, OPT_EXPERT, {    &video_codec_name }, "force video decoder",    "decoder_name" },
     { "autorotate",         OPT_TYPE_BOOL,            0, { &autorotate }, "automatically rotate video", "" },
+    { "lowlatency",         OPT_TYPE_BOOL,   OPT_EXPERT, { &lowlatency }, "minimize display latency (smaller queues, faster refresh)", "" },
     { "find_stream_info",   OPT_TYPE_BOOL, OPT_INPUT | OPT_EXPERT, { &find_stream_info },
         "read and decode the streams to fill missing information with heuristics" },
     { "filter_threads",     OPT_TYPE_INT,    OPT_EXPERT, { &filter_nbthreads }, "number of filter threads per graph" },
@@ -3946,7 +4192,10 @@ int main(int argc, char **argv)
                 do_exit(NULL);
             }
         } else {
-            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+            Uint32 render_flags = SDL_RENDERER_ACCELERATED;
+            if (!lowlatency)
+                render_flags |= SDL_RENDERER_PRESENTVSYNC;
+            renderer = SDL_CreateRenderer(window, -1, render_flags);
             if (!renderer) {
                 av_log(NULL, AV_LOG_WARNING, "Failed to initialize a hardware accelerated renderer: %s\n", SDL_GetError());
                 renderer = SDL_CreateRenderer(window, -1, 0);

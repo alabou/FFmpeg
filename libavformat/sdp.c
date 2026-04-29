@@ -664,6 +664,44 @@ static int sdp_write_media_attributes(char *buff, int size, const AVStream *st,
                                      payload_type,
                                      p->sample_rate, p->ch_layout.nb_channels);
         break;
+    case AV_CODEC_ID_AM824:
+        if (payload_type >= RTP_PT_PRIVATE) {
+            int nchan = p->ch_layout.nb_channels;
+            const AVDictionaryEntry *co_entry;
+            av_strlcatf(buff, size, "a=rtpmap:%d AM824/%d/%d\r\n",
+                                     payload_type,
+                                     p->sample_rate, nchan);
+            /* ptime per ST 2110-31 Table 1 */
+            if (p->sample_rate == 48000)
+                av_strlcatf(buff, size, "a=ptime:1\r\n");
+            else if (p->sample_rate == 96000)
+                av_strlcatf(buff, size, "a=ptime:1\r\n");
+            else if (p->sample_rate == 44100)
+                av_strlcatf(buff, size, "a=ptime:1.09\r\n");
+            /* channel-order fmtp per ST 2110-31 Section 6.2.
+             * If the stream has a "channel_order" metadata key (e.g.,
+             * "SMPTE2110.(ST,AES3)"), use it directly.
+             * Otherwise generate a default with all-ST groups. */
+            co_entry = av_dict_get(st->metadata, "channel_order", NULL, 0);
+            if (co_entry && co_entry->value[0]) {
+                av_strlcatf(buff, size, "a=fmtp:%d channel-order=%s\r\n",
+                            payload_type, co_entry->value);
+            } else {
+                int nsignals = nchan / 2;
+                if (nsignals > 0) {
+                    int sig;
+                    av_strlcatf(buff, size, "a=fmtp:%d channel-order=SMPTE2110.(",
+                                payload_type);
+                    for (sig = 0; sig < nsignals; sig++) {
+                        if (sig > 0)
+                            av_strlcatf(buff, size, ",");
+                        av_strlcatf(buff, size, "ST");
+                    }
+                    av_strlcatf(buff, size, ")\r\n");
+                }
+            }
+        }
+        break;
     case AV_CODEC_ID_PCM_MULAW:
         if (payload_type >= RTP_PT_PRIVATE)
             av_strlcatf(buff, size, "a=rtpmap:%d PCMU/%d/%d\r\n",
@@ -940,6 +978,18 @@ int av_sdp_create(AVFormatContext *ac[], int n_files, char *buf, int size)
                                 crypto_suite, crypto_params);
                 av_free(crypto_suite);
                 av_free(crypto_params);
+            }
+            if (ac[i]->privacy_encrypt &&
+                ac[i]->pep_mode && ac[i]->pep_iv &&
+                ac[i]->pep_key_generator && ac[i]->pep_key_version) {
+                av_strlcatf(buf, size,
+                            "a=privacy:protocol=%s;mode=%s;iv=%s;"
+                            "key_generator=%s;key_version=%s\r\n",
+                            ac[i]->pep_rtp_kv ? "RTP_KV" : "RTP",
+                            ac[i]->pep_mode,
+                            ac[i]->pep_iv,
+                            ac[i]->pep_key_generator,
+                            ac[i]->pep_key_version);
             }
         }
     }

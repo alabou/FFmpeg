@@ -90,8 +90,9 @@ typedef struct RTPStatistics {
     uint32_t jitter;            ///< estimated jitter.
 } RTPStatistics;
 
-#define RTP_FLAG_KEY    0x1 ///< RTP packet contains a keyframe
-#define RTP_FLAG_MARKER 0x2 ///< RTP marker bit was set for this packet
+#define RTP_FLAG_KEY        0x1 ///< RTP packet contains a keyframe
+#define RTP_FLAG_MARKER     0x2 ///< RTP marker bit was set for this packet
+#define RTP_FLAG_EXTHDRFULL 0x4 ///< Full encrpytion header detected for this packet
 /**
  * Packet parsing for "private" payloads in the RTP specs.
  *
@@ -188,6 +189,14 @@ struct RTPDemuxContext {
     /* dynamic payload stuff */
     const RTPDynamicProtocolHandler *handler;
     PayloadContext *dynamic_protocol_context;
+
+    struct AVCipherCB * hdcp_cipher;
+    struct AVCipherCB * privacy_cipher;
+
+    uint32_t encryption_stream_ctr; // also used for key_version
+    uint64_t encryption_input_ctr; // to keep the MSB for short headers
+    uint64_t encryption_current_ctr; // to check forward progress
+    int privacy_mac_size; // 0 for CTR-only, 8 for CMAC modes
 };
 
 /**

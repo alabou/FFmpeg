@@ -308,6 +308,8 @@ extern const FFCodec ff_rv40_decoder;
 extern const FFCodec ff_rv60_decoder;
 extern const FFCodec ff_s302m_encoder;
 extern const FFCodec ff_s302m_decoder;
+extern const FFCodec ff_am824_encoder;
+extern const FFCodec ff_am824_decoder;
 extern const FFCodec ff_sanm_decoder;
 extern const FFCodec ff_scpr_decoder;
 extern const FFCodec ff_screenpresso_decoder;

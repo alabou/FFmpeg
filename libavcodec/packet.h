@@ -369,6 +369,15 @@ enum AVPacketSideDataType {
      AV_PKT_DATA_EXIF,
 
     /**
+     * IPMX USB source device timing metadata.
+     * Carries per-packet UVC PTS, SCR, USB frame number, and
+     * dwClockFrequency from the source device.  Used by the IPMX USB
+     * sender to reconstruct wire timing from a local USB capture source.
+     * The data is IpmxUsbTimingSideData (defined in ipmx_timing.h).
+     */
+    AV_PKT_DATA_IPMX_USB_TIMING,
+
+    /**
      * The number of side data types.
      * This is not part of the public API/ABI in the sense that it may
      * change when new side data types are added.

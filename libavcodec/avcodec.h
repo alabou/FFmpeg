@@ -336,6 +336,19 @@ typedef struct RcOverride{
  */
 #define AV_CODEC_FLAG2_FAST           (1 <<  0)
 /**
+ * Publish codec sequence headers (SPS/PPS/VPS, AudioSpecificConfig, etc.) into
+ * avctx->extradata at avcodec_open2() time, regardless of in-band header
+ * repetition behaviour.
+ *
+ * Distinct from AV_CODEC_FLAG_GLOBAL_HEADER, which both populates extradata
+ * AND disables in-band repetition. This flag does only the former: useful for
+ * muxers that want codec params (e.g. for PSI section descriptors in mpegts)
+ * while still needing in-band headers in the elementary stream for random
+ * access. Encoders that already populate extradata unconditionally are
+ * unaffected by this flag.
+ */
+#define AV_CODEC_FLAG2_EXTRADATA      (1 <<  1)
+/**
  * Skip bitstream encoding.
  */
 #define AV_CODEC_FLAG2_NO_OUTPUT      (1 <<  2)

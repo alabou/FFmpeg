@@ -28,7 +28,10 @@
 #include "libavutil/random_seed.h"
 #include "libavutil/opt.h"
 
+#include "rtp.h"
 #include "rtpenc.h"
+#include "rtp_cipher.h"
+#include "rtp_pep.h"
 
 static const AVOption options[] = {
     FF_RTP_FLAG_OPTS(RTPMuxContext, flags),
@@ -90,6 +93,7 @@ static int is_supported(enum AVCodecID id)
     case AV_CODEC_ID_RAWVIDEO:
     case AV_CODEC_ID_BITPACKED:
     case AV_CODEC_ID_G728:
+    case AV_CODEC_ID_AM824:
         return 1;
     default:
         return 0;
@@ -122,6 +126,111 @@ static int rtp_write_header(AVFormatContext *s1)
     } else {
         /* private option takes priority */
         st->id = s->payload_type;
+    }
+
+    if (s1->hdcp_scramble) {
+        if (!s1->video_hdcp_cipher.callback) {
+            s1->video_hdcp_cipher.callback = dummy_xor_hdcp_cipher;
+            s1->video_hdcp_cipher.param = 1;
+        }
+        if (!s1->audio_hdcp_cipher.callback) {
+            s1->audio_hdcp_cipher.callback = dummy_xor_hdcp_cipher;
+            s1->audio_hdcp_cipher.param = 1;
+        }
+        if (!s1->data_hdcp_cipher.callback) {
+            s1->data_hdcp_cipher.callback = dummy_xor_hdcp_cipher;
+            s1->data_hdcp_cipher.param = 1;
+        }
+        s1->full_ctr = 1;
+    }
+
+    if (s1->privacy_encrypt) {
+        if (s1->privacy_scramble) {
+            av_log(s1, AV_LOG_ERROR, "privacy_encrypt and privacy_scramble are mutually exclusive\n");
+            return AVERROR(EINVAL);
+        }
+        {
+            RtpPepContext *pep_ctx = av_mallocz(sizeof(*pep_ctx));
+            if (!pep_ctx)
+                return AVERROR(ENOMEM);
+            if (rtp_pep_init(pep_ctx, s1, s1->pep_psk, s1->pep_mode,
+                             s1->pep_iv, s1->pep_key_generator,
+                             s1->pep_key_version, s1->pep_rtp_kv) < 0) {
+                av_free(pep_ctx);
+                return AVERROR(EINVAL);
+            }
+            /* Wire kv_rotate: only valid with RTP_KV */
+            if (s1->pep_kv_rotate > 0) {
+                if (!s1->pep_rtp_kv) {
+                    av_log(s1, AV_LOG_ERROR, "pep_kv_rotate requires pep_rtp_kv=1\n");
+                    av_free(pep_ctx);
+                    return AVERROR(EINVAL);
+                }
+                pep_ctx->kv_rotate_slices = s1->pep_kv_rotate;
+            }
+            s1->video_privacy_cipher.callback = rtp_pep_cipher_callback;
+            s1->video_privacy_cipher.opaque = pep_ctx;
+            s1->video_privacy_cipher.param = pep_ctx->key_version;
+            s1->audio_privacy_cipher.callback = rtp_pep_cipher_callback;
+            s1->audio_privacy_cipher.opaque = pep_ctx;
+            s1->audio_privacy_cipher.param = pep_ctx->key_version;
+            s1->data_privacy_cipher.callback = rtp_pep_cipher_callback;
+            s1->data_privacy_cipher.opaque = pep_ctx;
+            s1->data_privacy_cipher.param = pep_ctx->key_version;
+            /* Set owner_cb so rotation can update .param for the active stream type */
+            pep_ctx->owner_cb = &s1->video_privacy_cipher; /* default; codec_type selection below overrides */
+            s1->full_ctr = 1;
+            s1->privacy_mac_size = av_ipmx_pep_mode_has_cmac(pep_ctx->mode)
+                                   ? AV_IPMX_PEP_CMAC_TAG_SIZE : 0;
+        }
+    } else if (s1->privacy_scramble) {
+        if (!s1->video_privacy_cipher.callback) {
+            s1->video_privacy_cipher.callback = dummy_xor_privacy_cipher;
+            s1->video_privacy_cipher.param = 1;
+        }
+        if (!s1->audio_privacy_cipher.callback) {
+            s1->audio_privacy_cipher.callback = dummy_xor_privacy_cipher;
+            s1->audio_privacy_cipher.param = 1;
+        }
+        if (!s1->data_privacy_cipher.callback) {
+            s1->data_privacy_cipher.callback = dummy_xor_privacy_cipher;
+            s1->data_privacy_cipher.param = 1;
+        }
+        s1->full_ctr = 1;
+    }
+
+    {
+        struct AVCipherCB * hdcp_cipher;
+        struct AVCipherCB * privacy_cipher;
+
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            hdcp_cipher = &s1->video_hdcp_cipher;
+            privacy_cipher = &s1->video_privacy_cipher;
+        } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            hdcp_cipher = &s1->audio_hdcp_cipher;
+            privacy_cipher = &s1->audio_privacy_cipher;
+        } else {
+            hdcp_cipher = &s1->data_hdcp_cipher;
+            privacy_cipher = &s1->data_privacy_cipher;
+        }
+
+        if (privacy_cipher && privacy_cipher->callback) {
+            s->privacy_cipher = privacy_cipher;
+            s->encryption_input_ctr = 0;
+            s->encryption_stream_ctr = privacy_cipher->param;
+            /* Update owner_cb to point to the actual stream-type cipher */
+            if (privacy_cipher->opaque) {
+                RtpPepContext *pep = (RtpPepContext *)privacy_cipher->opaque;
+                if (pep->kv_rotate_slices > 0)
+                    pep->owner_cb = privacy_cipher;
+            }
+        }
+
+        if (hdcp_cipher && hdcp_cipher->callback) {
+            s->hdcp_cipher = hdcp_cipher;
+            s->encryption_input_ctr = 0;
+            s->encryption_stream_ctr = hdcp_cipher->param;
+        }
     }
 
     s->base_timestamp = av_get_random_seed();
@@ -161,6 +270,17 @@ static int rtp_write_header(AVFormatContext *s1)
         return AVERROR(ENOMEM);
     }
     s->max_payload_size = s1->packet_size - 12;
+
+    // If there is encryption then we must reserve space for the extended header. We reserve
+    // space the the full header because some formats like MPT2-TS and other audio ones require
+    // to write an integral number of frames or packets into the payload such that we cannot
+    // dynamically reserve for either the full or short header. The inneficiency is mainly
+    // caused by the ffmpeg architecture.
+    if (s->hdcp_cipher || s->privacy_cipher) {
+        s->max_payload_size = s->max_payload_size - sizeof(struct RTP_ExtHdrFull);
+        /* Reserve space for CMAC-64 MAC tag (8 bytes) if CMAC mode is active */
+        s->max_payload_size -= s1->privacy_mac_size;
+    }
 
     if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
         avpriv_set_pts_info(st, 32, 1, st->codecpar->sample_rate);
@@ -362,18 +482,115 @@ static void rtcp_send_sr(AVFormatContext *s1, int64_t ntp_time, int bye)
    must update the timestamp itself */
 void ff_rtp_send_data(AVFormatContext *s1, const uint8_t *buf1, int len, int m)
 {
+    int extHdr = 0;
+    int ext = 0;
     RTPMuxContext *s = s1->priv_data;
+    int cipher_flags = 0;
 
     av_log(s1, AV_LOG_TRACE, "rtp_send_data size=%d\n", len);
 
+    if (s->hdcp_cipher || s->privacy_cipher) {
+        extHdr = 1;
+    }
+
     /* build the RTP header */
-    avio_w8(s1->pb, RTP_VERSION << 6);
+    avio_w8(s1->pb, (RTP_VERSION << 6) | (extHdr << 4));
     avio_w8(s1->pb, (s->payload_type & 0x7f) | ((m & 0x01) << 7));
     avio_wb16(s1->pb, s->seq);
     avio_wb32(s1->pb, s->timestamp);
     avio_wb32(s1->pb, s->ssrc);
 
-    avio_write(s1->pb, buf1, len);
+    if (s->hdcp_cipher || s->privacy_cipher) {
+
+        if (s1->full_ctr) {
+
+            struct RTP_ExtHdrFull hdr = {0};
+            hdr.be = 0xBE;
+            hdr.de = 0xDE;
+            hdr.length_0 = 4;
+            hdr.l = 0x0E;
+            hdr.id = 1;
+
+            hdr.input_ctr_7 = (s->encryption_input_ctr >> (7*8)) & 255;
+            hdr.input_ctr_6 = (s->encryption_input_ctr >> (6*8)) & 255;
+            hdr.input_ctr_5 = (s->encryption_input_ctr >> (5*8)) & 255;
+            hdr.input_ctr_4 = (s->encryption_input_ctr >> (4*8)) & 255;
+            hdr.input_ctr_3 = (s->encryption_input_ctr >> (3*8)) & 255;
+            hdr.input_ctr_2 = (s->encryption_input_ctr >> (2*8)) & 255;
+            hdr.input_ctr_1 = (s->encryption_input_ctr >> (1*8)) & 255;
+            hdr.input_ctr_0 = (s->encryption_input_ctr >> (0*8)) & 255;
+
+            // refresh the stream_ctr from external cipher
+            if (s->hdcp_cipher) {
+                if (s->hdcp_cipher->param != s->encryption_stream_ctr) {
+                    s->encryption_stream_ctr = s->hdcp_cipher->param;
+                }
+            } else if (s->privacy_cipher) {
+                if (s->privacy_cipher->param != s->encryption_stream_ctr) {
+                    s->encryption_stream_ctr = s->privacy_cipher->param;
+                }
+            }
+
+            // Used for both HDCP and PEP .. if both are active it is the HDCP stream-ctr
+            hdr.inband_ctr_3 = (s->encryption_stream_ctr >> (3*8)) & 255;
+            hdr.inband_ctr_2 = (s->encryption_stream_ctr >> (2*8)) & 255;
+            hdr.inband_ctr_1 = (s->encryption_stream_ctr >> (1*8)) & 255;
+            hdr.inband_ctr_0 = (s->encryption_stream_ctr >> (0*8)) & 255;
+
+            cipher_flags |= AVCIPHERCB_VALIDPARAM | AVCIPHERCB_VALIDINPUTCTR;
+
+            avio_write(s1->pb, (const uint8_t*)&hdr, sizeof(hdr));
+
+            ext = sizeof(hdr);
+
+            av_log(s1, AV_LOG_TRACE, "rtp_send_data HDCP/PEP header FULL streamCtr=%d, inputCtr=%ld\n", s->encryption_stream_ctr, s->encryption_input_ctr);
+
+        } else {
+
+            struct RTP_ExtHdrShort hdr = {0};
+
+            hdr.be = 0xBE;
+            hdr.de = 0xDE;
+            hdr.length_0 = 1;
+            hdr.l = 0x02;
+            hdr.id = 2;
+
+            hdr.input_ctr_2 = (s->encryption_input_ctr >> (2*8)) & 255;
+            hdr.input_ctr_1 = (s->encryption_input_ctr >> (1*8)) & 255;
+            hdr.input_ctr_0 = (s->encryption_input_ctr >> (0*8)) & 255;
+
+            avio_write(s1->pb, (const uint8_t*)&hdr, sizeof(hdr));
+
+            ext = sizeof(hdr);
+
+            av_log(s1, AV_LOG_TRACE, "rtp_send_data HDCP/PEP header SHORT streamCtr=%d, inputCtr=%ld\n", s->encryption_stream_ctr, s->encryption_input_ctr);
+        }
+
+        av_log(s, AV_LOG_TRACE, "rtp_send_data EXTHDR size=%d, payload=%0x%0x%0x%0x\n", ext, buf1[0], buf1[1], buf1[2], buf1[3]);
+
+    } else {
+
+        av_log(s, AV_LOG_TRACE, "rtp_send_data EXTHDR size=%d, payload=%0x%0x%0x%0x\n", ext, buf1[0], buf1[1], buf1[2], buf1[3]);
+    }
+
+    #pragma GCC diagnostic ignored "-Wdiscarded-qualifiers"
+
+    if (s->hdcp_cipher) {
+        // !!! encrypting over the incoming data (TODO: check if required to do otherwise)
+        s->hdcp_cipher->callback(s->hdcp_cipher->opaque, s->encryption_stream_ctr, s->encryption_input_ctr, buf1 + s1->payload_header_size, len - s1->payload_header_size, cipher_flags);
+    }
+
+    if (s->privacy_cipher) {
+        int pep_flags = cipher_flags | AVCIPHERCB_ENCRYPT;
+        s->privacy_cipher->callback(s->privacy_cipher->opaque, s->encryption_stream_ctr, s->encryption_input_ctr, buf1 + s1->payload_header_size, len - s1->payload_header_size, pep_flags);
+    }
+
+    {
+        int encrypted_len = len - s1->payload_header_size + s1->privacy_mac_size;
+        s->encryption_input_ctr += (encrypted_len & 15) ? (encrypted_len >> 4) + 1 : (encrypted_len >> 4); // once after both encryptions
+    }
+
+    avio_write(s1->pb, buf1, len + s1->privacy_mac_size);
     avio_flush(s1->pb);
 
     s->seq = (s->seq + 1) & 0xffff;
@@ -406,6 +623,8 @@ static int rtp_send_samples(AVFormatContext *s1,
         buf1 += len;
         size -= len;
         s->timestamp = s->cur_timestamp + n * 8 / sample_size_bits;
+        s1->payload_header_size = 0;
+        s1->full_ctr = (n == 0);
         ff_rtp_send_data(s1, s->buf, s->buf_ptr - s->buf, 0);
         n += (s->buf_ptr - s->buf);
     }
@@ -473,12 +692,16 @@ static void rtp_send_raw(AVFormatContext *s1,
     max_packet_size = s->max_payload_size;
 
     while (size > 0) {
-        len = max_packet_size;
-        if (len > size)
-            len = size;
+        len = FFMIN(max_packet_size, size);
+
+        /* Copy into s->buf so the CMAC callback has headroom for the
+         * MAC tag without corrupting the next chunk in the source buffer. */
+        memcpy(s->buf, buf1, len);
 
         s->timestamp = s->cur_timestamp;
-        ff_rtp_send_data(s1, buf1, len, (len == size));
+        s1->payload_header_size = 0;
+        s1->full_ctr = 1;
+        ff_rtp_send_data(s1, s->buf, len, (len == size));
 
         buf1 += len;
         size -= len;
@@ -504,6 +727,8 @@ static void rtp_send_mpegts_raw(AVFormatContext *s1,
 
         out_len = s->buf_ptr - s->buf;
         if (out_len >= s->max_payload_size) {
+            s1->payload_header_size = 0;
+            s1->full_ctr = 1;
             ff_rtp_send_data(s1, s->buf, out_len, 0);
             s->buf_ptr = s->buf;
         }
@@ -578,6 +803,9 @@ static int rtp_write_packet(AVFormatContext *s1, AVPacket *pkt)
         return rtp_send_samples(s1, pkt->data, size, 16 * st->codecpar->ch_layout.nb_channels);
     case AV_CODEC_ID_PCM_S24BE:
         return rtp_send_samples(s1, pkt->data, size, 24 * st->codecpar->ch_layout.nb_channels);
+    case AV_CODEC_ID_AM824:
+        ff_rtp_send_am824(s1, pkt->data, size);
+        break;
     case AV_CODEC_ID_ADPCM_G722:
         /* The actual sample size is half a byte per sample, but since the
          * stream clock rate is 8000 Hz while the sample rate is 16000 Hz,
@@ -710,3 +938,4 @@ const FFOutputFormat ff_rtp_muxer = {
     .p.priv_class      = &rtp_muxer_class,
     .p.flags           = AVFMT_NODIMENSIONS | AVFMT_TS_NONSTRICT,
 };
+

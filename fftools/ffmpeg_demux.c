@@ -218,6 +218,21 @@ static int seek_to_start(Demuxer *d, Timestamp end_pts)
     if (d->loop > 0)
         d->loop--;
 
+    /* Adjust wallclock_start so that readrate_sleep() does not stall
+     * at the loop boundary.  The duration offset added by
+     * ifile_duration_update() shifts all post-loop DTS forward,
+     * but readrate_sleep() computes "now" from wallclock_start which
+     * hasn't changed.  Without this adjustment, readrate_sleep() sees
+     * pts >> now and blocks for one full file duration.
+     *
+     * The adjustment: shift wallclock_start backwards by the file
+     * duration so that (wall_elapsed + duration) matches the new DTS. */
+    if (d->readrate > 0.0f) {
+        int64_t dur_us = av_rescale_q(d->duration.ts, d->duration.tb,
+                                      AV_TIME_BASE_Q);
+        d->wallclock_start -= (int64_t)(dur_us / d->readrate);
+    }
+
     return ret;
 }
 
@@ -751,7 +766,7 @@ static int input_thread(void *arg)
         ret = av_read_frame(f->ctx, dt.pkt_demux);
 
         if (ret == AVERROR(EAGAIN)) {
-            av_usleep(10000);
+            av_usleep(5000);
             continue;
         }
         if (ret < 0) {
@@ -769,12 +784,28 @@ static int input_thread(void *arg)
             ret = err_merge(ret == AVERROR_EOF ? 0 : ret, ret_bsf);
 
             if (d->loop) {
-                /* signal looping to our consumers */
-                dt.pkt_demux->stream_index = -1;
-                ret = sch_demux_send(d->sch, f->index, dt.pkt_demux, 0);
-                if (ret >= 0)
-                    ret = seek_to_start(d, (Timestamp){ .ts = dt.pkt_demux->pts,
-                                                        .tb = dt.pkt_demux->time_base });
+                /* Check if any stream needs decoding (not -c copy).
+                 * If all streams are copy-only, skip the looping signal
+                 * to avoid a blocking scheduler round-trip that stalls
+                 * the output pipeline for 10-100 ms at the loop boundary. */
+                int needs_flush = 0;
+                for (int i = 0; i < f->nb_streams; i++) {
+                    if (ds_from_ist(f->streams[i])->decoding_needed) {
+                        needs_flush = 1;
+                        break;
+                    }
+                }
+
+                if (needs_flush) {
+                    /* signal looping to our consumers */
+                    dt.pkt_demux->stream_index = -1;
+                    ret = sch_demux_send(d->sch, f->index, dt.pkt_demux, 0);
+                    if (ret < 0)
+                        break;
+                }
+
+                ret = seek_to_start(d, (Timestamp){ .ts = dt.pkt_demux->pts,
+                                                    .tb = dt.pkt_demux->time_base });
                 if (ret >= 0)
                     continue;
 

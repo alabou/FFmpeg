@@ -38,6 +38,7 @@
 #include "libavcodec/opus/opus.h"
 #include "avformat.h"
 #include "mpegts.h"
+#include "rtp_pep.h"
 #include "internal.h"
 #include "avio_internal.h"
 #include "demux.h"
@@ -182,6 +183,16 @@ struct MpegTSContext {
 
     AVStream *epg_stream;
     AVBufferPool* pools[32];
+
+    /* PEP decryption (TR-10-13) for MPEG2-TS over UDP */
+    char *pep_psk;
+    char *pep_mode;
+    char *pep_iv;
+    char *pep_key_generator;
+    char *pep_key_version;
+    void *pep_context;             /**< RtpPepContext* (NULL = disabled) */
+    uint64_t pep_input_ctr;
+    uint32_t pep_key_ver;
 };
 
 #define MPEGTS_OPTIONS \
@@ -211,6 +222,16 @@ static const AVOption options[] = {
      {.i64 = 0}, 0, 1, 0 },
     {"max_packet_size", "maximum size of emitted packet", offsetof(MpegTSContext, max_packet_size), AV_OPT_TYPE_INT,
      {.i64 = 204800}, 1, INT_MAX/2, AV_OPT_FLAG_DECODING_PARAM },
+    {"pep_psk", "PEP pre-shared key (hex) for MPEG-TS decryption", offsetof(MpegTSContext, pep_psk), AV_OPT_TYPE_STRING,
+     {.str = NULL}, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
+    {"pep_mode", "PEP cipher mode (e.g. AES-128-CTR)", offsetof(MpegTSContext, pep_mode), AV_OPT_TYPE_STRING,
+     {.str = NULL}, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
+    {"pep_iv", "PEP base IV (hex)", offsetof(MpegTSContext, pep_iv), AV_OPT_TYPE_STRING,
+     {.str = NULL}, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
+    {"pep_key_generator", "PEP key generator (hex)", offsetof(MpegTSContext, pep_key_generator), AV_OPT_TYPE_STRING,
+     {.str = NULL}, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
+    {"pep_key_version", "PEP key version (hex)", offsetof(MpegTSContext, pep_key_version), AV_OPT_TYPE_STRING,
+     {.str = NULL}, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
     { NULL },
 };
 
@@ -2987,6 +3008,7 @@ static int handle_packet(MpegTSContext *ts, const uint8_t *packet, int64_t pos)
     MpegTSFilter *tss;
     int len, pid, cc, expected_cc, cc_ok, afc, is_start, is_discontinuity,
         has_adaptation, has_payload;
+    int pep_allow_decrypt = 0;
     const uint8_t *p, *p_end;
 
     pid = AV_RB16(packet + 1) & 0x1fff;
@@ -3046,6 +3068,36 @@ static int handle_packet(MpegTSContext *ts, const uint8_t *packet, int64_t pos)
         int pcr_l;
         if (parse_pcr(&pcr_h, &pcr_l, packet) == 0)
             tss->last_pcr = pcr_h * SYSTEM_CLOCK_FREQUENCY_DIVISOR + pcr_l;
+
+        /* PEP: parse CTR header from transport_private_data */
+        if (ts->pep_context && pid >= 0x0010 && pid <= 0x1ffe) {
+            int af_len = packet[4];
+            int pep_pcr_sz = (af_len > 0 && (packet[5] & 0x10)) ? 6 : 0;
+
+            if (af_len > 0 && (packet[5] & 0x02) && (packet[6 + pep_pcr_sz] >= 3)) {
+                int priv_len = packet[6 + pep_pcr_sz];
+
+                pep_allow_decrypt = 1;
+
+                if (priv_len >= 12) {
+                    /* Full header: key_version(4) + input_ctr(8) */
+                    ts->pep_key_ver = AV_RB32(packet + 6 + pep_pcr_sz + 1);
+                    ts->pep_input_ctr = AV_RB64(packet + 6 + pep_pcr_sz + 5);
+                } else {
+                    /* Short header: lower 24 bits of input_ctr */
+                    uint32_t ctr_short = ((uint32_t)packet[6 + pep_pcr_sz + 1] << 16) |
+                                         ((uint32_t)packet[6 + pep_pcr_sz + 2] << 8) |
+                                         (uint32_t)packet[6 + pep_pcr_sz + 3];
+                    uint32_t prev24 = ts->pep_input_ctr & 0xFFFFFF;
+                    uint64_t upper40 = ts->pep_input_ctr >> 24;
+                    if (prev24 < ctr_short)
+                        ts->pep_input_ctr = (upper40 << 24) | ctr_short;
+                    else
+                        ts->pep_input_ctr = ((upper40 + 1) << 24) | ctr_short;
+                }
+            }
+        }
+
         /* skip adaptation field */
         p += p[0] + 1;
     }
@@ -3053,6 +3105,37 @@ static int handle_packet(MpegTSContext *ts, const uint8_t *packet, int64_t pos)
     p_end = packet + TS_PACKET_SIZE;
     if (p >= p_end || !has_payload)
         return 0;
+
+    /* PEP: decrypt payload if CTR header found in adaptation field private data. */
+    if (ts->pep_context && pep_allow_decrypt) {
+        RtpPepContext *pep = (RtpPepContext *)ts->pep_context;
+        int payload_len = p_end - p;
+
+        /* KV re-derivation: if key_version from CTR header differs from current */
+        if (pep->is_rtp_kv && ts->pep_key_ver != pep->key_version) {
+            uint8_t kv_bytes[4];
+            int key_bits = av_ipmx_pep_mode_key_bits(pep->mode);
+            AV_WB32(kv_bytes, ts->pep_key_ver);
+            if (av_ipmx_pep_derive_key(pep->psk, pep->psk_len,
+                                        pep->key_generator, kv_bytes,
+                                        pep->key, key_bits) == 0) {
+                pep->key_version = ts->pep_key_ver;
+                av_log(ts->stream, AV_LOG_INFO,
+                       "PEP: key_version re-derived for %08x\n", ts->pep_key_ver);
+            }
+        }
+
+        if (payload_len > 0) {
+            #pragma GCC diagnostic push
+            #pragma GCC diagnostic ignored "-Wdiscarded-qualifiers"
+            av_ipmx_pep_aes_ctr(pep->key, pep->key_len, pep->iv_prime,
+                                 ts->pep_input_ctr,
+                                 p, (uint8_t *)p, payload_len);
+            #pragma GCC diagnostic pop
+            /* Do NOT advance pep_input_ctr here — the next packet's
+             * CTR header (full or short) will set it correctly. */
+        }
+    }
 
     if (pos >= 0) {
         av_assert0(pos >= TS_PACKET_SIZE);
@@ -3347,6 +3430,29 @@ static int mpegts_read_header(AVFormatContext *s)
     }
     ts->stream     = s;
     ts->auto_guess = 0;
+
+    /* PEP decryption initialization.
+     * Check both demuxer private data and AVFormatContext for PEP options. */
+    {
+        const char *psk = (ts->pep_psk && ts->pep_psk[0]) ? ts->pep_psk :
+                          (s->pep_psk && s->pep_psk[0]) ? s->pep_psk : NULL;
+        const char *mode = ts->pep_mode ? ts->pep_mode : s->pep_mode;
+        const char *iv = ts->pep_iv ? ts->pep_iv : s->pep_iv;
+        const char *kg = ts->pep_key_generator ? ts->pep_key_generator : s->pep_key_generator;
+        const char *kv = ts->pep_key_version ? ts->pep_key_version : s->pep_key_version;
+
+        if (psk && !ts->pep_context) {
+            RtpPepContext *pep_ctx = av_mallocz(sizeof(*pep_ctx));
+            if (pep_ctx && rtp_pep_init(pep_ctx, s, psk, mode, iv, kg, kv, s->pep_rtp_kv) >= 0) {
+                ts->pep_context = pep_ctx;
+                ts->pep_input_ctr = 0;
+                ts->pep_key_ver = pep_ctx->key_version;
+                av_log(s, AV_LOG_INFO, "MPEG-TS PEP decryption enabled\n");
+            } else {
+                av_free(pep_ctx);
+            }
+        }
+    }
 
     if (s->iformat == &ff_mpegts_demuxer.p) {
         /* normal demux */

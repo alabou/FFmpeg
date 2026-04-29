@@ -61,6 +61,11 @@ void ff_rtp_send_raw_rfc4175(AVFormatContext *s1, const uint8_t *buf, int size, 
             return;
     }
 
+    // For RFC 4175 (video raw) the paylaod header is 2 byte in addition to 6 byte
+    // per scanline included. All the payload header bytes are at the beginning of
+    // payload.
+    s1->full_ctr = 1;
+
     while (i < height) {
         int left = s->max_payload_size;
         uint8_t *dest = s->buf;
@@ -68,11 +73,13 @@ void ff_rtp_send_raw_rfc4175(AVFormatContext *s1, const uint8_t *buf, int size, 
         const int head_size = 6;
         int next_line;
         int length, cont, pixels;
+        int payload_header_size = 0;
 
         /* Extended Sequence Number */
         *dest++ = 0;
         *dest++ = 0;
         left   -= 2;
+        payload_header_size += 2;
 
         headers = dest;
         do {
@@ -110,13 +117,16 @@ void ff_rtp_send_raw_rfc4175(AVFormatContext *s1, const uint8_t *buf, int size, 
                 offset  = 0;
             else
                 offset += pixels;
+
+            payload_header_size += 6;
+
         } while (cont);
 
         do {
             int l_field;
             int l_line;
             int l_off;
-            int64_t copy_offset;
+            int copy_offset;
 
             length    = (headers[0] << 8) | headers[1];
             l_field   = (headers[2] & 0x80) >> 7;
@@ -127,13 +137,20 @@ void ff_rtp_send_raw_rfc4175(AVFormatContext *s1, const uint8_t *buf, int size, 
 
             if (interlaced)
                 l_line = 2 * l_line + l_field;
-            copy_offset = (l_line * (int64_t)width + l_off) * pgroup / xinc;
+            copy_offset = (l_line * width + l_off) * pgroup / xinc;
             if (copy_offset + length > size)
                 break;
             memcpy (dest, buf + copy_offset, length);
             dest += length;
         } while (cont);
 
+        s1->payload_header_size = payload_header_size;
         ff_rtp_send_data (s1, s->buf, s->max_payload_size - left, i >= height);
-    }
+        
+        if (next_line) {
+            s1->full_ctr = 1;
+        } else {
+            s1->full_ctr = 0;
+        }
+   }
 }

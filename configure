@@ -242,6 +242,7 @@ External library support:
   --enable-libgsm          enable GSM de/encoding via libgsm [no]
   --enable-libiec61883     enable iec61883 via libiec61883 [no]
   --enable-libilbc         enable iLBC de/encoding via libilbc [no]
+  --enable-libusb-1        enable local USB device access via libusb [no]
   --enable-libjack         enable JACK audio sound server [no]
   --enable-libjxl          enable JPEG XL de/encoding via libjxl [no]
   --enable-libklvanc       enable Kernel Labs VANC processing [no]
@@ -2054,6 +2055,7 @@ EXTERNAL_LIBRARY_LIST="
     libgsm
     libiec61883
     libilbc
+    libusb_1
     libjack
     libjxl
     libklvanc
@@ -3985,6 +3987,12 @@ gdigrab_indev_extralibs="-lgdi32"
 gdigrab_indev_select="bmp_decoder"
 iec61883_indev_deps="libiec61883"
 iec61883_indev_select="dv_demuxer"
+ipmx_usb_indev_deps="openssl pthreads"
+ipmx_usb_indev_extralibs="-lssl -lcrypto"
+ipmx_usb_local_indev_deps="libusb_1"
+ipmx_usb_local_indev_extralibs="-lusb-1.0"
+ipmx_usb_sender_outdev_deps="openssl pthreads"
+ipmx_usb_sender_outdev_extralibs="-lssl -lcrypto"
 jack_indev_deps="libjack"
 jack_indev_deps_any="sem_timedwait dispatch_dispatch_h"
 kmsgrab_indev_deps="libdrm"
@@ -7240,6 +7248,7 @@ enabled libaribb24        && { check_pkg_config libaribb24 "aribb24 > 1.0.3" "ar
 enabled libaribcaption    && require_pkg_config libaribcaption "libaribcaption >= 1.1.1" "aribcaption/aribcaption.h" aribcc_context_alloc
 enabled lv2               && require_pkg_config lv2 lilv-0 "lilv/lilv.h" lilv_world_new
 enabled libiec61883       && require libiec61883 libiec61883/iec61883.h iec61883_cmp_connect -lraw1394 -lavc1394 -lrom1394 -liec61883
+enabled libusb_1          && require_pkg_config libusb_1 libusb-1.0 libusb-1.0/libusb.h libusb_init
 enabled libass            && require_pkg_config libass "libass >= 0.11.0" ass/ass.h ass_library_init
 enabled libbluray         && require_pkg_config libbluray libbluray libbluray/bluray.h bd_open
 enabled libbs2b           && require_pkg_config libbs2b libbs2b bs2b.h bs2b_open

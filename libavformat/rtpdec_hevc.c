@@ -185,11 +185,41 @@ static int hevc_handle_packet(AVFormatContext *ctx, PayloadContext *rtp_hevc_ctx
     int first_fragment, last_fragment, fu_type;
     uint8_t new_nal_header[2];
     int res = 0;
+    RTPDemuxContext* s = ctx->parent.d;
+    char is_corrupt = 0;
+    int cipher_flags = 0;
 
     /* sanity check for size of input packet: 1 byte payload at least */
     if (len < RTP_HEVC_PAYLOAD_HEADER_SIZE + 1) {
         av_log(ctx, AV_LOG_ERROR, "Too short RTP/HEVC packet, got %d bytes\n", len);
         return AVERROR_INVALIDDATA;
+    }
+
+    #pragma GCC diagnostic ignored "-Wdiscarded-qualifiers"
+
+    if (flags & RTP_FLAG_EXTHDRFULL) cipher_flags |= AVCIPHERCB_VALIDPARAM | AVCIPHERCB_VALIDINPUTCTR;
+
+    if (s && s->privacy_cipher) {
+        if (s->privacy_cipher->callback(s->privacy_cipher->opaque,
+                s->encryption_stream_ctr, s->encryption_input_ctr, buf + 2,
+                len - 2, cipher_flags) < 0)
+            return AVERROR_INVALIDDATA; // in-place
+    }
+    len -= s->privacy_mac_size;
+
+    if (s && s->hdcp_cipher) {
+        if (s->hdcp_cipher->callback(s->hdcp_cipher->opaque,
+                s->encryption_stream_ctr, s->encryption_input_ctr, buf + 2,
+                len - 2, cipher_flags) < 0)
+            return AVERROR_INVALIDDATA; // in-place
+    }
+
+    s->encryption_current_ctr = s->encryption_input_ctr + ((len - 2) & 15) ? ((len - 2) >> 4) + 1 : ((len - 2) >> 4); // once after both encryptions
+
+    /* save the flags */
+    if (pkt->flags & AV_PKT_FLAG_CORRUPT)
+    {
+        is_corrupt = 1;
     }
 
     /*
@@ -335,6 +365,12 @@ static int hevc_handle_packet(AVFormatContext *ctx, PayloadContext *rtp_hevc_ctx
     }
 
     pkt->stream_index = st->index;
+
+    /* restore the flags */
+    if (is_corrupt)
+    {
+        pkt->flags |= AV_PKT_FLAG_CORRUPT;
+    }
 
     return res;
 }

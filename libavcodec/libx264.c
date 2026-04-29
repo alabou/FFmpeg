@@ -1407,7 +1407,12 @@ static av_cold int X264_init(AVCodecContext *avctx)
     if (!x4->enc)
         return AVERROR_EXTERNAL;
 
-    if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
+    /* Populate extradata with SPS/PPS when either:
+     *   - AV_CODEC_FLAG_GLOBAL_HEADER  (classic out-of-band-only mode), or
+     *   - AV_CODEC_FLAG2_EXTRADATA     (publish-also mode, in-band stays on).
+     * The b_repeat_headers control above remains tied strictly to GLOBAL_HEADER. */
+    if ((avctx->flags  & AV_CODEC_FLAG_GLOBAL_HEADER) ||
+        (avctx->flags2 & AV_CODEC_FLAG2_EXTRADATA)) {
         ret = set_extradata(avctx);
         if (ret < 0)
             return ret;

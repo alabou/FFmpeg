@@ -27,6 +27,30 @@
 #include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/time.h"
+
+/* Architecture-specific spin hint for busy-wait pacing loops.
+ * On x86: PAUSE instruction reduces power and avoids memory-order violations.
+ * On ARM: YIELD hints the core to switch to another hardware thread.
+ * Elsewhere: no-op. */
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define spin_hint() _mm_pause()
+#elif defined(__aarch64__)
+#define spin_hint() __asm__ volatile("yield" ::: "memory")
+#else
+#define spin_hint() ((void)0)
+#endif
+
+/* CBR pacing: busy-spin the last N microseconds for sub-ms precision.
+ * Coarse sleep (av_usleep) handles the bulk of the wait, then the
+ * spin loop provides precise wakeup at the target time. */
+#define CBR_PACE_SPIN_US  500   /* spin last 0.5 ms */
+#define CBR_PACE_MAX_EARLY_US 500000  /* ignore target if > 0.5s in future */
+
+#include <stdatomic.h>
+#include <stdio.h>
+#include <pthread.h>
 
 #include "libavcodec/ac3_parser_internal.h"
 #include "libavcodec/bytestream.h"
@@ -36,11 +60,53 @@
 #include "libavcodec/vvc.h"
 #include "libavcodec/startcode.h"
 
+#include "avc.h"
 #include "avformat.h"
 #include "avio_internal.h"
 #include "internal.h"
 #include "mpegts.h"
 #include "mux.h"
+#include "nal.h"
+#include "rtp_pep.h"
+
+/* ------------------------------------------------------------------
+ * Threaded output: a single dedicated thread drains a lockless SPSC
+ * ring buffer at strict mux_rate (one packet per packet-duration).
+ * The mux thread enqueues packets into the ring without pacing, so
+ * that scheduler stalls in the mux thread are absorbed by the ring
+ * rather than creating on-wire bursts when the mux thread catches up.
+ *
+ * The ring is a classical single-producer / single-consumer lockless
+ * FIFO: mux thread owns tail, output thread owns head.  No mutex, no
+ * condvar — both threads make forward progress without ever entering
+ * the kernel (except for av_usleep in the pacer, which the output
+ * thread avoids by busy-spinning).  This removes the ~µs-per-emit
+ * scheduler disturbance that pthread_mutex/cond_wait introduced.
+ *
+ * The output thread is the sole writer to:
+ *   - s->pb (avio)
+ *   - ts->interleave_output_bytes (used for PCR rewrite)
+ *   - ts->out_last_emit_us (the pacing clock)
+ *
+ * Capacity must be a power of two (index masking).  MPEGTS_OUT_RING_CAP
+ * = 4096 absorbs ~260 ms of mux-thread stall at 23.8 Mbps.  Memory
+ * cost: ~770 kB.
+ * ------------------------------------------------------------------ */
+#define MPEGTS_OUT_RING_CAP  4096
+#define MPEGTS_OUT_RING_MASK (MPEGTS_OUT_RING_CAP - 1)
+
+typedef struct MpegTSOutRing {
+    uint8_t packets[MPEGTS_OUT_RING_CAP][TS_PACKET_SIZE];
+    _Atomic int head;        /* next index to dequeue (owned: consumer) */
+    _Atomic int tail;        /* next index to enqueue (owned: producer) */
+    _Atomic int shutdown;    /* 1 = mux thread has signalled end-of-stream */
+    /* Diagnostics (written by either thread; only read at end). */
+    _Atomic int64_t total_emits;
+    _Atomic int64_t late_emits;
+    _Atomic int64_t producer_full_spins;
+    _Atomic int64_t consumer_empty_spins;
+    _Atomic int max_depth;
+} MpegTSOutRing;
 
 #define PCR_TIME_BASE 27000000
 
@@ -125,6 +191,8 @@ typedef struct MpegTSWrite {
     int64_t pat_period_us;
     int64_t sdt_period_us;
     int64_t nit_period_us;
+    int64_t pat_min_gap_us;
+    int64_t pat_min_gap;   /* in PCR time base, derived from pat_min_gap_us */
     int64_t last_pat_ts;
     int64_t last_sdt_ts;
     int64_t last_nit_ts;
@@ -132,6 +200,50 @@ typedef struct MpegTSWrite {
     uint8_t provider_name[256];
 
     int omit_video_pes_length;
+
+    /* CBR output pacing: when enabled, write_packet() sleeps to maintain
+     * constant bitrate output. This prevents burst delivery on UDP.
+     * The pacing target is derived from total_size (the same counter that
+     * drives PCR), so pacing and PCR are locked — zero drift by construction. */
+    int cbr_pacing;             /* 0 = off (default), 1 = enabled */
+    int cbr_pacing_threaded;    /* 1 = pace in a dedicated output thread */
+    int cbr_pacing_spin;        /* threaded pacer: pure busy-spin instead of sleep+spin */
+    int64_t pacing_start_us;    /* wall-clock time when total_size was 0 */
+
+    /* Threaded-output state (used only when cbr_pacing_threaded).
+     * The output thread is the sole writer of s->pb,
+     * interleave_output_bytes, and out_last_emit_us. */
+    MpegTSOutRing *out_ring;
+    pthread_t out_thread;
+    int out_thread_started;
+    int64_t out_last_emit_us;
+
+    /* TS packet interleaving: completes FFmpeg's AVPacket-level interleaving
+     * (ff_interleave_packet_per_dts in mux.c) with TS-packet-level
+     * distribution.  Without this, mpegts_write_pes() dumps all TS packets
+     * for a single PES contiguously (~1000 video packets in a row), violating
+     * the H.222.0 T-STD TBn 512-byte transport buffer model. */
+    int ts_interleave;          /* 0 = off (chunked), 1 = null-interleave, 2 = full-interleave */
+    int ts_interleave_chunk;    /* video TS packets per round (default 7) */
+    int interleave_buffering;   /* 1 = inside mpegts_write_pes, buffer packets */
+    int64_t interleave_output_bytes; /* bytes written to avio during drain */
+    int64_t last_psi_output_bytes;   /* iob at last PSI emission (for TBsys spacing) */
+
+    /* Per-PID interleave buffers — indexed by stream index.
+     * SI/null packets use interleave_si_buf. */
+    uint8_t *interleave_si_buf;
+    int interleave_si_capacity; /* in packets */
+    int interleave_si_count;
+
+    /* PEP encryption (TR-10-13) for MPEG2-TS over UDP */
+    char *pep_psk;
+    char *pep_mode;
+    char *pep_iv;
+    char *pep_key_generator;
+    char *pep_key_version;
+    void *pep_context;             /**< RtpPepContext* (NULL = disabled) */
+    uint64_t pep_input_ctr;
+    uint32_t pep_key_ver;
 } MpegTSWrite;
 
 /* a PES packet header is generated every DEFAULT_PES_HEADER_FREQ packets */
@@ -267,6 +379,11 @@ typedef struct MpegTSWriteStream {
     int opus_pending_trim_start;
 
     DVBAC3Descriptor *dvb_ac3_desc;
+
+    /* Per-stream interleave output buffer (ts_interleave mode) */
+    uint8_t *interleave_buf;
+    int interleave_buf_capacity; /* in packets */
+    int interleave_buf_count;
 } MpegTSWriteStream;
 
 static void mpegts_write_pat(AVFormatContext *s)
@@ -338,6 +455,298 @@ static int put_arib_caption_descriptor(AVFormatContext *s, uint8_t **q_ptr,
     *q_ptr = q;
 
     return 0;
+}
+
+/* AAC profile_and_level_indication for ETSI EN 300 468 §6.2.3.2
+ * AAC_descriptor (tag 0x7C). Derived from codec profile + channel count +
+ * sample rate. Tells DVB-compliant probes the correct T-STD Rxn class so
+ * multichannel AAC streams aren't validated against the 2 Mbps stereo
+ * baseline. Table mapping per ETSI EN 300 468 Table 110:
+ *
+ *   AAC Main:          0x18..0x1B (L1..L4..L5)
+ *   AAC LC:            0x28..0x2C (L1, L2, L4, L5, L6)
+ *   HE-AAC:            0x40..0x44 (L2..L6)
+ *   HE-AAC v2 (PS):    0x58..0x59 (L2..L3)
+ */
+
+/* Decode AAC profile from the AudioSpecificConfig (ISO/IEC 14496-3 § 1.6.2):
+ * the top 5 bits of byte 0 carry audioObjectType (AOT). Maps to the FFmpeg
+ * AV_PROFILE_AAC_* constants. Returns AV_PROFILE_UNKNOWN if extradata is too
+ * short, the AOT is escape-coded (>= 31, requires 11-bit decode), or the AOT
+ * is one we don't represent.
+ *
+ * Only the common AOTs that have a corresponding AV_PROFILE_AAC_* constant
+ * are mapped; anything else falls through to UNKNOWN so the caller can use
+ * its own default.
+ */
+static int aac_profile_from_extradata(const AVCodecParameters *par)
+{
+    int aot;
+
+    if (!par->extradata || par->extradata_size < 1)
+        return AV_PROFILE_UNKNOWN;
+
+    aot = (par->extradata[0] >> 3) & 0x1F;
+    switch (aot) {
+    case 1:  return AV_PROFILE_AAC_MAIN;
+    case 2:  return AV_PROFILE_AAC_LOW;
+    case 5:  return AV_PROFILE_AAC_HE;
+    case 23: return AV_PROFILE_AAC_LD;
+    case 29: return AV_PROFILE_AAC_HE_V2;
+    case 39: return AV_PROFILE_AAC_ELD;
+    default: return AV_PROFILE_UNKNOWN;
+    }
+}
+
+static int aac_profile_and_level(const AVCodecParameters *par)
+{
+    int channels = par->ch_layout.nb_channels;
+    int sample_rate = par->sample_rate;
+    int profile = par->profile;
+    int base, level;
+
+    /* When codecpar->profile is unset (live encode through an encoder that
+     * doesn't write avctx->profile back, e.g. libfdk_aac), fall back to the
+     * AudioSpecificConfig in extradata. Requires the encoder to publish ASC
+     * — set AV_CODEC_FLAG_GLOBAL_HEADER or AV_CODEC_FLAG2_EXTRADATA on the
+     * encoder context to get that. If neither path yields a profile, the
+     * existing AAC LC default applies. */
+    if (profile == AV_PROFILE_UNKNOWN)
+        profile = aac_profile_from_extradata(par);
+
+    if (profile == AV_PROFILE_AAC_HE_V2)
+        base = 0x58;        /* HE-AAC v2 */
+    else if (profile == AV_PROFILE_AAC_HE)
+        base = 0x40;        /* HE-AAC */
+    else if (profile == AV_PROFILE_AAC_MAIN)
+        base = 0x18;        /* AAC Main */
+    else
+        base = 0x28;        /* AAC LC (default) */
+
+    /* level offset within the profile block:
+     *   0 = L1 (≤24 kHz mono)
+     *   1 = L2 (≤48 kHz stereo)
+     *   2 = L4 (5.1 ≤ 48 kHz)
+     *   3 = L5 (5.1 ≤ 96 kHz / higher rate)
+     *   4 = L6 (7.1)
+     */
+    if (channels >= 7)
+        level = 4;
+    else if (channels >= 3 && sample_rate > 48000)
+        level = 3;
+    else if (channels >= 3)
+        level = 2;
+    else if (sample_rate > 24000 || channels > 1)
+        level = 1;
+    else
+        level = 0;
+
+    return base + level;
+}
+
+static void put_aac_descriptor(uint8_t **q_ptr, const AVCodecParameters *par)
+{
+    uint8_t *q = *q_ptr;
+    *q++ = AAC_DESCRIPTOR;                  /* tag = 0x7C */
+    *q++ = 2;                               /* descriptor_length */
+    *q++ = aac_profile_and_level(par);      /* profile_and_level_indication */
+    *q++ = 0x00;                            /* AAC_type_flag=0, SAOC_DE_flag=0, reserved */
+    *q_ptr = q;
+}
+
+/*
+ * H.222.0 § 2.6.64 (Table 2-92): AVC_video_descriptor.
+ *
+ * Carries profile_idc / constraint flags / level_idc so receivers can apply the
+ * § 2.14.3.1 T-STD MBn formulas without parsing the elementary stream. We do
+ * not emit AVC_timing_and_HRD_descriptor (tag 0x2A); per § 2.6.66 its absence
+ * signals the leak method, which is what we use.
+ *
+ * codecpar->profile carries profile_idc in the low 8 bits and constraint
+ * flags in the upper bits (AV_PROFILE_H264_CONSTRAINED -> constraint_set1,
+ * AV_PROFILE_H264_INTRA -> constraint_set3).
+ */
+/*
+ * Locate AVC SPS bytes in extradata and fill profile_idc / constraint_flags /
+ * level_idc. Two layouts handled:
+ *   - AVCDecoderConfigurationRecord (mp4 format): byte 0=0x01, byte 1=profile,
+ *     byte 2=constraint_flags, byte 3=level (ISO/IEC 14496-15 § 5.3.3.1.2)
+ *   - Annex B (raw NAL units): scan for the SPS NAL via the standard helpers
+ *     (avpriv_find_start_code + ff_nal_find_startcode), then parse with
+ *     ff_avc_decode_sps. Same pattern as mxfenc.c.
+ *
+ * Returns 1 on success, 0 if SPS not found / not parseable.
+ */
+static int extract_avc_sps_fields(const AVCodecParameters *par,
+                                  int *out_profile_idc,
+                                  int *out_constraint_flags,
+                                  int *out_level_idc)
+{
+    const uint8_t *ed = par->extradata;
+    int ed_size = par->extradata_size;
+
+    if (!ed || ed_size < 4)
+        return 0;
+
+    /* mp4 AVCDecoderConfigurationRecord: profile/cs/level at fixed offsets. */
+    if (ed[0] == 0x01) {
+        *out_profile_idc      = ed[1];
+        *out_constraint_flags = ed[2];
+        *out_level_idc        = ed[3];
+        return 1;
+    }
+
+    /* Annex B: scan for the SPS NAL using ffmpeg's standard helpers. */
+    {
+        const uint8_t *buf = ed, *buf_end = ed + ed_size, *nal_end;
+        uint32_t state = -1;
+        H264SPS sps;
+        int i;
+
+        while (buf < buf_end) {
+            buf = avpriv_find_start_code(buf, buf_end, &state);
+            if (buf >= buf_end)
+                break;
+            if ((state & 0x1F) != H264_NAL_SPS)
+                continue;
+            nal_end = ff_nal_find_startcode(buf, buf_end);
+            if (ff_avc_decode_sps(&sps, buf, nal_end - buf) < 0)
+                return 0;
+            *out_profile_idc = sps.profile_idc;
+            *out_level_idc   = sps.level_idc;
+            /* H264SPS.constraint_set_flags is LSB-first (cs0=bit0..cs5=bit5);
+             * the caller and our descriptor wire format expect MSB-first
+             * (cs0=bit7..cs5=bit2, low 2 bits = AVC_compatible_flags = 0). */
+            *out_constraint_flags = 0;
+            for (i = 0; i < 6; i++)
+                if (sps.constraint_set_flags & (1 << i))
+                    *out_constraint_flags |= 1 << (7 - i);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void put_avc_video_descriptor(uint8_t **q_ptr, const AVCodecParameters *par)
+{
+    uint8_t *q = *q_ptr;
+    int profile = par->profile;
+    int level   = par->level;
+    int profile_idc, cs1, cs3, constraint_flags = 0;
+
+    /* First try codecpar (set by demuxer for -c copy flows). If that's
+     * unset (live encode flows where the encoder hasn't written back to
+     * AVCodecContext::profile/level), fall back to scanning extradata —
+     * works when the encoder ran with AV_CODEC_FLAG_GLOBAL_HEADER, e.g.
+     * ffmpeg CLI:  -flags:v +global_header -bsf:v dump_extra=freq=keyframe */
+    if (profile != AV_PROFILE_UNKNOWN && level != AV_LEVEL_UNKNOWN) {
+        profile_idc = profile & 0xFF;
+        cs1 = (profile & AV_PROFILE_H264_CONSTRAINED) ? 1 : 0;
+        cs3 = (profile & AV_PROFILE_H264_INTRA)       ? 1 : 0;
+    } else {
+        int sps_profile, sps_level;
+        if (!extract_avc_sps_fields(par, &sps_profile, &constraint_flags, &sps_level))
+            return;
+        profile_idc = sps_profile;
+        level       = sps_level;
+        cs1 = (constraint_flags >> 6) & 1;   /* constraint_set1_flag */
+        cs3 = (constraint_flags >> 4) & 1;   /* constraint_set3_flag */
+    }
+
+    *q++ = AVC_VIDEO_DESCRIPTOR;              /* tag 0x28 */
+    *q++ = 4;                                 /* descriptor_length */
+    *q++ = profile_idc;
+    *q++ = (cs1 << 6) | (cs3 << 4);           /* cs0..cs5 + AVC_compatible_flags=00 */
+    *q++ = level & 0xFF;                      /* level_idc */
+    *q++ = (1 << 5) | 0x1F;                   /* AVC_still=0, 24h=0,
+                                               * Frame_Packing_SEI_not_present=1, reserved=11111 */
+    *q_ptr = q;
+}
+
+/*
+ * Extract the 12-byte profile_tier_level() block (general_profile_space ..
+ * general_level_idc) from HEVC extradata. Both layouts are supported:
+ *   - HEVCDecoderConfigurationRecord (ISO/IEC 14496-15 § 8.3.3): bytes 1..12
+ *   - Annex B (raw NAL units): scan for an SPS NAL (type 33), then skip the
+ *     2-byte NAL header and the first SPS byte (sps_vps_id[4] |
+ *     sps_max_sub_layers_minus1[3] | sps_temporal_id_nesting_flag[1]); the
+ *     next 12 bytes are profile_tier_level() with profilePresentFlag=1 and
+ *     maxNumSubLayersMinus1=0.
+ *
+ * Returns 0 on success (out_ptl filled with 12 bytes), <0 if neither layout
+ * yields the data — caller skips emission rather than guess.
+ */
+static int hevc_extract_profile_tier_level(const AVCodecParameters *par,
+                                           uint8_t out_ptl[12])
+{
+    const uint8_t *ed = par->extradata;
+    int ed_size = par->extradata_size;
+    int i;
+
+    if (!ed || ed_size < 13)
+        return -1;
+
+    /* HEVCDecoderConfigurationRecord: configurationVersion = 1 in byte 0. */
+    if (ed[0] == 0x01 && ed_size >= 23) {
+        memcpy(out_ptl, ed + 1, 12);
+        return 0;
+    }
+
+    /* Annex B: scan for an SPS NAL (type 33) start code. */
+    for (i = 0; i + 4 <= ed_size; i++) {
+        const uint8_t *p;
+        int hdr_len, nal_type;
+
+        if (ed[i] != 0x00)
+            continue;
+        if (i + 3 < ed_size && ed[i + 1] == 0x00 && ed[i + 2] == 0x00 && ed[i + 3] == 0x01) {
+            p = ed + i + 4;
+            hdr_len = 4;
+        } else if (ed[i + 1] == 0x00 && ed[i + 2] == 0x01) {
+            p = ed + i + 3;
+            hdr_len = 3;
+        } else {
+            continue;
+        }
+        if (p + 2 + 1 + 12 > ed + ed_size)
+            return -1;
+        nal_type = (p[0] >> 1) & 0x3F;
+        if (nal_type == HEVC_NAL_SPS) {
+            memcpy(out_ptl, p + 2 + 1, 12);
+            return 0;
+        }
+        i += hdr_len - 1;
+    }
+    return -1;
+}
+
+/*
+ * H.222.0 § 2.6.95 (Table 2-113): HEVC_video_descriptor.
+ *
+ * The descriptor's first 12 bytes (profile_space..level_idc) are byte-for-byte
+ * identical to bytes 1..12 of HEVCDecoderConfigurationRecord and to the
+ * profile_tier_level() block inside the SPS, so we extract them as-is.
+ *
+ * Per § 2.14.3 the MBn -> EBn leak rate for HEVC depends on tier_flag, which
+ * cannot be derived from codecpar alone. If extradata does not give us
+ * profile_tier_level we skip emission rather than emit incorrect tier info.
+ */
+static void put_hevc_video_descriptor(uint8_t **q_ptr, const AVCodecParameters *par)
+{
+    uint8_t *q = *q_ptr;
+    uint8_t ptl[12];
+
+    if (hevc_extract_profile_tier_level(par, ptl) < 0)
+        return;
+
+    *q++ = HEVC_VIDEO_DESCRIPTOR;             /* tag 0x38 */
+    *q++ = 13;                                /* descriptor_length */
+    memcpy(q, ptl, 12);                       /* profile_space..level_idc (96 bits) */
+    q += 12;
+    *q++ = (1 << 4) | (0x3 << 2) | 0x3;       /* temporal_layer_subset=0, still=0, 24h=0,
+                                               * sub_pic_hrd_params_not_present=1,
+                                               * reserved=11, HDR_WCG_idc=11 (no indication) */
+    *q_ptr = q;
 }
 
 static void put_registration_descriptor(uint8_t **q_ptr, uint32_t tag)
@@ -576,6 +985,14 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
                 put_registration_descriptor(&q, MKTAG('A', 'C', '-', '3'));
             if (codec_id == AV_CODEC_ID_EAC3)
                 put_registration_descriptor(&q, MKTAG('E', 'A', 'C', '3'));
+            if (codec_id == AV_CODEC_ID_AAC || codec_id == AV_CODEC_ID_AAC_LATM) {
+                /* 4 bytes: tag + len + profile_and_level + flags */
+                if (q - data > SECTION_LENGTH - 4) {
+                    err = 1;
+                    break;
+                }
+                put_aac_descriptor(&q, st->codecpar);
+            }
             if (ts->flags & MPEGTS_FLAG_SYSTEM_B) {
                 if (codec_id == AV_CODEC_ID_AC3) {
                     DVBAC3Descriptor *dvb_ac3_desc = ts_st->dvb_ac3_desc;
@@ -812,6 +1229,27 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
                        stream_type == STREAM_TYPE_VIDEO_AVS3) {
                 put_registration_descriptor(&q, MKTAG('A', 'V', 'S', 'V'));
             }
+            if (stream_type == STREAM_TYPE_VIDEO_H264) {
+                /* AVC_video_descriptor: 6 bytes (tag + len + 4 payload).
+                 * Note: in transcode pipelines (e.g. -c:v libx264), codecpar
+                 * is filled from the encoder context only after the encoder
+                 * produces its first packet, which happens after write_header.
+                 * In that case profile/level read as -99 here and we emit no
+                 * descriptor. The remux/copy path (e.g. -c copy from an mp4)
+                 * has codecpar populated by the demuxer and works correctly. */
+                if (q - data > SECTION_LENGTH - 6) {
+                    err = 1;
+                    break;
+                }
+                put_avc_video_descriptor(&q, st->codecpar);
+            } else if (stream_type == STREAM_TYPE_VIDEO_HEVC) {
+                /* HEVC_video_descriptor: 15 bytes (tag + len + 13 payload) */
+                if (q - data > SECTION_LENGTH - 15) {
+                    err = 1;
+                    break;
+                }
+                put_hevc_video_descriptor(&q, st->codecpar);
+            }
             break;
         case AVMEDIA_TYPE_DATA:
             if (codec_id == AV_CODEC_ID_SMPTE_KLV) {
@@ -963,6 +1401,610 @@ invalid:
     return 0;
 }
 
+/* Forward declaration — defined later, needed by interleave_write_raw */
+static int write_pcr_bits(uint8_t *buf, int64_t pcr);
+
+/* ------------------------------------------------------------------ */
+/* TS packet interleaving — buffer/drain helpers                       */
+/* ------------------------------------------------------------------ */
+
+/* Known SI PIDs that route to the SI buffer during interleaving.
+ * Null packets (0x1FFF) are NOT routed to SI — they are CBR padding
+ * and should be distributed evenly, not bunched with SI tables. */
+static int is_si_pid(int pid)
+{
+    return pid < 0x0020;
+}
+
+/* Grow an interleave buffer to hold at least `needed` packets */
+static int interleave_buf_grow(uint8_t **buf, int *capacity, int needed)
+{
+    int new_cap;
+    uint8_t *new_buf;
+
+    if (needed <= *capacity)
+        return 0;
+    new_cap = FFMAX(*capacity * 2, needed);
+    new_buf = av_realloc(*buf, (int64_t)new_cap * TS_PACKET_SIZE);
+    if (!new_buf)
+        return AVERROR(ENOMEM);
+    *buf = new_buf;
+    *capacity = new_cap;
+    return 0;
+}
+
+/* Enqueue one 188-byte TS packet into the appropriate interleave buffer.
+ * Null packets (0x1FFF) are discarded — they will be regenerated at drain
+ * time as needed to maintain CBR rate via the pacing mechanism. */
+static void interleave_enqueue(AVFormatContext *s, const uint8_t *packet)
+{
+    MpegTSWrite *ts = s->priv_data;
+    int pid = ((packet[1] & 0x1F) << 8) | packet[2];
+    int i;
+
+    /* Null packets (0x1FFF) routing depends on interleave mode:
+     * Mode 1 (null-interleave): nulls go to video buffer, audio interleaves
+     *   among nulls. Works when Rxn_video > muxrate.
+     * Mode 2 (full-interleave): nulls go to SI buffer, so the drain
+     *   interleaves audio directly among video packets. Works for all
+     *   profiles/levels regardless of Rxn vs muxrate. */
+    if (pid == 0x1FFF) {
+        if (ts->ts_interleave == 1) {
+            /* Mode 1: nulls → video buffer */
+            for (i = 0; i < s->nb_streams; i++) {
+                MpegTSWriteStream *ts_st = s->streams[i]->priv_data;
+                if (ts_st && s->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    interleave_buf_grow(&ts_st->interleave_buf,
+                                        &ts_st->interleave_buf_capacity,
+                                        ts_st->interleave_buf_count + 1);
+                    memcpy(ts_st->interleave_buf +
+                           (int64_t)ts_st->interleave_buf_count * TS_PACKET_SIZE,
+                           packet, TS_PACKET_SIZE);
+                    ts_st->interleave_buf_count++;
+                    return;
+                }
+            }
+        }
+        /* Mode 2 or no video stream: nulls → SI buffer */
+    }
+
+    if (is_si_pid(pid)) {
+        /* SI (PAT, PMT, SDT, NIT, PCR-only for other streams) → shared SI buffer */
+        interleave_buf_grow(&ts->interleave_si_buf,
+                            &ts->interleave_si_capacity,
+                            ts->interleave_si_count + 1);
+        memcpy(ts->interleave_si_buf +
+               (int64_t)ts->interleave_si_count * TS_PACKET_SIZE,
+               packet, TS_PACKET_SIZE);
+        ts->interleave_si_count++;
+    } else {
+        /* Elementary stream → find per-stream buffer by PID */
+        for (i = 0; i < s->nb_streams; i++) {
+            MpegTSWriteStream *ts_st = s->streams[i]->priv_data;
+            if (ts_st && ts_st->pid == pid) {
+                interleave_buf_grow(&ts_st->interleave_buf,
+                                    &ts_st->interleave_buf_capacity,
+                                    ts_st->interleave_buf_count + 1);
+                memcpy(ts_st->interleave_buf +
+                       (int64_t)ts_st->interleave_buf_count * TS_PACKET_SIZE,
+                       packet, TS_PACKET_SIZE);
+                ts_st->interleave_buf_count++;
+                return;
+            }
+        }
+        /* PID not found among streams — treat as SI (e.g., PMT PID) */
+        interleave_buf_grow(&ts->interleave_si_buf,
+                            &ts->interleave_si_capacity,
+                            ts->interleave_si_count + 1);
+        memcpy(ts->interleave_si_buf +
+               (int64_t)ts->interleave_si_count * TS_PACKET_SIZE,
+               packet, TS_PACKET_SIZE);
+        ts->interleave_si_count++;
+    }
+}
+
+/* ------------------------------------------------------------------
+ * Threaded-output helpers.
+ *
+ * mpegts_out_emit_paced:  called only by the output thread.  Takes a
+ *   raw TS packet from the ring, rewrites PCR based on the current
+ *   output byte position, paces to at least one packet-duration after
+ *   the previous emit, then writes to avio.  This is the only place
+ *   s->pb, interleave_output_bytes, and out_last_emit_us are written
+ *   when threaded mode is on.
+ *
+ * mpegts_out_thread_fn:  top-level output-thread loop.  Dequeues from
+ *   the ring until shutdown is signalled AND the ring is empty, then
+ *   returns.  Blocks on the not_empty condvar when the ring is
+ *   momentarily empty.
+ * ------------------------------------------------------------------ */
+static void mpegts_out_emit_paced(AVFormatContext *s, uint8_t *packet)
+{
+    MpegTSWrite *ts = s->priv_data;
+
+    /* Rewrite PCR (same logic as non-threaded interleave_write_raw). */
+    {
+        int afc = (packet[3] >> 4) & 0x03;
+        if ((afc == 0x02 || afc == 0x03) && packet[4] >= 7) {
+            int pcr_flag = packet[5] & 0x10;
+            if (pcr_flag) {
+                int64_t pcr = av_rescale(ts->interleave_output_bytes + 11,
+                                         8 * PCR_TIME_BASE, ts->mux_rate) +
+                              ts->first_pcr;
+                write_pcr_bits(&packet[6], pcr);
+            }
+        }
+    }
+
+    /* Strict pd-spaced CBR pacing: each emit is at least pd after the
+     * previous one, clamped so the on-wire rate never exceeds mux_rate.
+     * Any wall-clock drift from the mux thread is absorbed by the ring
+     * buffer, not by the on-wire schedule.
+     *
+     * We advance out_last_emit_us by the planned target, not by post-write
+     * wall time.  Using wall time would bake avio_write() latency into the
+     * spacing and make the emit rate drift below mux_rate. */
+    if (ts->mux_rate > 1) {
+        int64_t now_us = av_gettime_relative();
+        int64_t pd_us = av_rescale(TS_PACKET_SIZE * 8, 1000000LL,
+                                   ts->mux_rate);
+        int64_t target_us;
+
+        if (ts->out_last_emit_us == 0)
+            target_us = now_us;
+        else
+            target_us = ts->out_last_emit_us + pd_us;
+
+        if (target_us > now_us) {
+            /* Default: coarse-sleep the bulk of each wait, spin only
+             * the last CBR_PACE_SPIN_US for precision.  This frees the
+             * CPU and — counterintuitively — empirically produces
+             * fewer late events than pure busy-spin on a stock Linux
+             * scheduler, because a cooperative thread is preempted
+             * less often than a 100%-CPU hog.  cbr_pacing_spin=1
+             * forces pure busy-spin for RT/isolcpus deployments. */
+            int64_t wait = target_us - now_us;
+            if (wait <= CBR_PACE_MAX_EARLY_US) {
+                if (!ts->cbr_pacing_spin && wait > CBR_PACE_SPIN_US)
+                    av_usleep((unsigned)(wait - CBR_PACE_SPIN_US));
+                while (av_gettime_relative() < target_us)
+                    spin_hint();
+            }
+        } else if (ts->out_last_emit_us != 0) {
+            /* Output thread ran late — cap target at now_us to prevent a
+             * run-away catch-up burst.  Each subsequent packet will be
+             * strictly pd-spaced from its actual emission time. */
+            atomic_fetch_add_explicit(&ts->out_ring->late_emits, 1,
+                                      memory_order_relaxed);
+            target_us = now_us;
+        }
+        ts->out_last_emit_us = target_us;
+        atomic_fetch_add_explicit(&ts->out_ring->total_emits, 1,
+                                  memory_order_relaxed);
+    }
+
+    if (ts->m2ts_mode) {
+        int64_t pcr = av_rescale(ts->interleave_output_bytes + 11,
+                                 8 * PCR_TIME_BASE, ts->mux_rate) +
+                      ts->first_pcr;
+        uint32_t tp_extra_header = pcr % 0x3fffffff;
+        tp_extra_header = AV_RB32(&tp_extra_header);
+        avio_write(s->pb, (unsigned char *)&tp_extra_header,
+                   sizeof(tp_extra_header));
+    }
+    avio_write(s->pb, packet, TS_PACKET_SIZE);
+    ts->interleave_output_bytes += TS_PACKET_SIZE;
+}
+
+static void *mpegts_out_thread_fn(void *arg)
+{
+    AVFormatContext *s = arg;
+    MpegTSWrite *ts = s->priv_data;
+    MpegTSOutRing *r = ts->out_ring;
+    uint8_t packet[TS_PACKET_SIZE];
+
+    for (;;) {
+        int head = atomic_load_explicit(&r->head, memory_order_relaxed);
+
+        /* Spin-wait for a packet.  Acquire-load pairs with the
+         * producer's release-store on tail.  No kernel entry. */
+        while (head == atomic_load_explicit(&r->tail,
+                                            memory_order_acquire)) {
+            if (atomic_load_explicit(&r->shutdown, memory_order_acquire))
+                return NULL;
+            atomic_fetch_add_explicit(&r->consumer_empty_spins, 1,
+                                      memory_order_relaxed);
+            spin_hint();
+        }
+
+        memcpy(packet, r->packets[head], TS_PACKET_SIZE);
+        atomic_store_explicit(&r->head,
+                              (head + 1) & MPEGTS_OUT_RING_MASK,
+                              memory_order_release);
+
+        mpegts_out_emit_paced(s, packet);
+    }
+}
+
+static int mpegts_out_thread_start(AVFormatContext *s)
+{
+    MpegTSWrite *ts = s->priv_data;
+    MpegTSOutRing *r;
+    int ret;
+
+    r = av_mallocz(sizeof(*r));
+    if (!r)
+        return AVERROR(ENOMEM);
+    ts->out_ring = r;
+
+    if ((ret = pthread_create(&ts->out_thread, NULL,
+                              mpegts_out_thread_fn, s))) {
+        av_freep(&ts->out_ring);
+        return AVERROR(ret);
+    }
+    ts->out_thread_started = 1;
+
+    return 0;
+}
+
+static void mpegts_out_thread_stop(AVFormatContext *s)
+{
+    MpegTSWrite *ts = s->priv_data;
+    MpegTSOutRing *r = ts->out_ring;
+
+    if (!ts->out_thread_started || !r)
+        return;
+
+    /* Signal shutdown — producer/consumer pick it up on next spin. */
+    atomic_store_explicit(&r->shutdown, 1, memory_order_release);
+
+    pthread_join(ts->out_thread, NULL);
+    ts->out_thread_started = 0;
+
+    {
+        int64_t emits = atomic_load_explicit(&r->total_emits,
+                                             memory_order_relaxed);
+        int64_t late = atomic_load_explicit(&r->late_emits,
+                                            memory_order_relaxed);
+        int64_t pspins = atomic_load_explicit(&r->producer_full_spins,
+                                              memory_order_relaxed);
+        int64_t cspins = atomic_load_explicit(&r->consumer_empty_spins,
+                                              memory_order_relaxed);
+        int hwmark = atomic_load_explicit(&r->max_depth,
+                                          memory_order_relaxed);
+        av_log(s, AV_LOG_INFO,
+               "cbr_pacing_threaded: emits=%lld late=%lld (%.3f%%) "
+               "ring hwmark=%d/%d p_spins=%lld c_spins=%lld\n",
+               (long long)emits, (long long)late,
+               emits ? 100.0 * late / emits : 0.0,
+               hwmark, MPEGTS_OUT_RING_CAP,
+               (long long)pspins, (long long)cspins);
+    }
+
+    av_freep(&ts->out_ring);
+}
+
+/* Write one packet directly to output with CBR pacing (used during drain).
+ * If the packet contains a PCR, recompute it based on the actual output
+ * byte position (interleave_output_bytes) rather than the buffering-time
+ * position (total_size).  This is necessary because interleaving changes
+ * the byte position of each packet. */
+static void interleave_write_raw(AVFormatContext *s, const uint8_t *packet_in)
+{
+    MpegTSWrite *ts = s->priv_data;
+    uint8_t packet[TS_PACKET_SIZE];
+
+    memcpy(packet, packet_in, TS_PACKET_SIZE);
+
+    /* Threaded output path: hand the raw packet (no PCR rewrite, no
+     * pacing) to the output thread via the ring buffer.  The output
+     * thread owns s->pb and interleave_output_bytes from this point. */
+    if (ts->cbr_pacing_threaded && ts->out_ring) {
+        MpegTSOutRing *r = ts->out_ring;
+        int tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
+        int next_tail = (tail + 1) & MPEGTS_OUT_RING_MASK;
+
+        /* Wait for a slot.  PAUSE-spin while full — this is the
+         * backpressure signal to the mux thread.  The output thread
+         * drains at strict mux_rate so the spin is bounded (<= pd). */
+        while (next_tail == atomic_load_explicit(&r->head,
+                                                 memory_order_acquire)) {
+            if (atomic_load_explicit(&r->shutdown, memory_order_relaxed))
+                return;
+            atomic_fetch_add_explicit(&r->producer_full_spins, 1,
+                                      memory_order_relaxed);
+            spin_hint();
+        }
+
+        memcpy(r->packets[tail], packet, TS_PACKET_SIZE);
+        /* Publish the new tail with release ordering so the output
+         * thread sees the packet bytes before the index update. */
+        atomic_store_explicit(&r->tail, next_tail, memory_order_release);
+
+        /* Track high-water mark (approximate; relaxed). */
+        {
+            int head = atomic_load_explicit(&r->head, memory_order_relaxed);
+            int depth = (next_tail - head) & MPEGTS_OUT_RING_MASK;
+            int cur = atomic_load_explicit(&r->max_depth, memory_order_relaxed);
+            if (depth > cur)
+                atomic_store_explicit(&r->max_depth, depth,
+                                      memory_order_relaxed);
+        }
+        return;
+    }
+
+    /* Rewrite PCR if present.  PCR location:
+     *   byte 4 = adaptation_field_length
+     *   byte 5 = adaptation flags (bit 4 = PCR_flag)
+     *   bytes 6-11 = PCR field (6 bytes) */
+    {
+        int afc = (packet[3] >> 4) & 0x03;
+        if ((afc == 0x02 || afc == 0x03) && packet[4] >= 7) {
+            int pcr_flag = packet[5] & 0x10;
+            if (pcr_flag) {
+                int64_t pcr = av_rescale(ts->interleave_output_bytes + 11,
+                                         8 * PCR_TIME_BASE, ts->mux_rate) +
+                              ts->first_pcr;
+                write_pcr_bits(&packet[6], pcr);
+            }
+        }
+    }
+
+    /* CBR pacing based on output byte count */
+    if (ts->cbr_pacing && ts->mux_rate > 1) {
+        int64_t now_us, target_us, wait;
+
+        now_us = av_gettime_relative();
+        if (ts->pacing_start_us == 0)
+            ts->pacing_start_us = now_us;
+
+        target_us = ts->pacing_start_us +
+                    av_rescale(ts->interleave_output_bytes, 8000000LL,
+                               ts->mux_rate);
+        wait = target_us - now_us;
+
+        if (wait > 0 && wait <= CBR_PACE_MAX_EARLY_US) {
+            if (wait > CBR_PACE_SPIN_US)
+                av_usleep((unsigned)(wait - CBR_PACE_SPIN_US));
+            while (av_gettime_relative() < target_us)
+                spin_hint();
+        }
+    }
+
+    if (ts->m2ts_mode) {
+        int64_t pcr = av_rescale(ts->interleave_output_bytes + 11,
+                                 8 * PCR_TIME_BASE, ts->mux_rate) +
+                      ts->first_pcr;
+        uint32_t tp_extra_header = pcr % 0x3fffffff;
+        tp_extra_header = AV_RB32(&tp_extra_header);
+        avio_write(s->pb, (unsigned char *)&tp_extra_header,
+                   sizeof(tp_extra_header));
+    }
+    avio_write(s->pb, packet, TS_PACKET_SIZE);
+    ts->interleave_output_bytes += TS_PACKET_SIZE;
+}
+
+/* Drain all interleave buffers in proportional round-robin order.
+ * Called after mpegts_write_pes() returns — all TS packets for the
+ * current PES are buffered and ready to be interleaved with packets
+ * from other streams' buffers. */
+static void interleave_drain(AVFormatContext *s)
+{
+    MpegTSWrite *ts = s->priv_data;
+    int total, chunk, i;
+
+    /* Count total buffered packets */
+    total = ts->interleave_si_count;
+    for (i = 0; i < s->nb_streams; i++) {
+        MpegTSWriteStream *ts_st = s->streams[i]->priv_data;
+        if (!ts_st) continue;
+        total += ts_st->interleave_buf_count;
+    }
+
+    if (total == 0)
+        return;
+
+    chunk = ts->ts_interleave_chunk;
+
+    /* Round-robin drain.  Each round emits, in order:
+     *   1) at most 1 SI packet (PAT/PMT/SDT/NIT),
+     *   2) up to `chunk` video packets (back-to-back — video Rxn
+     *      exceeds muxrate so TBn never accumulates),
+     *   3) at most ONE packet from each audio stream that has content.
+     *
+     * The per-packet round-robin in step 3 enforces the H.222.0 Annex D
+     * T-STD constraint: consecutive packets of any single audio PID are
+     * separated by at least (other-audio-streams-with-content + chunk + 1)
+     * packets, giving TBn time to drain at its per-codec Rxn.
+     *
+     * Concretely, at muxrate = 23.8 Mbps a single TS packet spans 63.2 µs;
+     * AAC 5.1 Rxn per Annex Q (1.2 × 576 kbps × 8 ch) = 5.53 Mbps drains
+     * 184 B in 266 µs, so same-PID packets must be spaced ≥ 266 µs apart.
+     * A single round of 1 SI + 8 video + N audio = (9 + N) × 63.2 µs ≥
+     * 568 µs for N ≥ 0, which satisfies the bound unconditionally.
+     *
+     * We intentionally do NOT drain multiple packets of the same audio PID
+     * in one round — even when the buffer has accumulated (e.g. after a
+     * stream-loop boundary).  The outer while-loop re-enters the video
+     * and SI phases between each audio pass, which keeps same-PID spacing
+     * bounded regardless of how long one stream has been starving
+     * relative to others. */
+    while (total > 0) {
+        int emitted_this_round = 0;
+        int non_audio_emitted = 0;
+
+        /* 1) SI packet — emit 1 per round.  The SI buffer holds two
+         *    distinct classes of packets, intermixed in FIFO order:
+         *
+         *     (a) PSI (PAT/PMT/SDT/NIT): decoder-visible, flow through
+         *         TBsys with Rxn = 1 Mbps (H.222.0 clause 2.4.2.4).
+         *         To satisfy P3.3 for TBsys, a 184-byte PSI payload
+         *         needs 184·8/Rxn = 1.472 ms of wall-clock drain time
+         *         before the next PSI arrives — otherwise TBsys
+         *         accumulates.  At muxrate=23.8 Mbps that translates
+         *         to a minimum spacing of ~4400 bytes of output.
+         *
+         *     (b) Null packets (PID 0x1FFF): never demultiplexed,
+         *         never touch any decoder buffer.  Emit freely.
+         *
+         *    Because PSI always precedes its trailing nulls in the
+         *    FIFO (both are enqueued within the same mpegts_write_pes
+         *    call, PSI first via retransmit_si_info, nulls after via
+         *    mpegts_insert_null_packet), gating PSI on spacing never
+         *    stalls a null behind it.  If the front is PSI and spacing
+         *    isn't met, we just skip SI emission this round — the PSI
+         *    emits in a later round once enough bytes have gone out. */
+        {
+            int did_si = 0;
+            if (ts->interleave_si_count > 0) {
+                const uint8_t *front = ts->interleave_si_buf;
+                int front_pid = ((front[1] & 0x1f) << 8) | front[2];
+                int is_null = (front_pid == 0x1FFF);
+                int spacing_ok = 1;
+                if (!is_null) {
+                    int64_t gap = ts->interleave_output_bytes -
+                                  ts->last_psi_output_bytes;
+                    int64_t min_gap = (int64_t)TS_PACKET_SIZE *
+                                      ts->mux_rate / 1000000;
+                    spacing_ok = (gap >= min_gap);
+                }
+                if (is_null || spacing_ok) {
+                    interleave_write_raw(s, ts->interleave_si_buf);
+                    ts->interleave_si_count--;
+                    if (ts->interleave_si_count > 0)
+                        memmove(ts->interleave_si_buf,
+                                ts->interleave_si_buf + TS_PACKET_SIZE,
+                                (int64_t)ts->interleave_si_count * TS_PACKET_SIZE);
+                    total--;
+                    emitted_this_round++;
+                    did_si = 1;
+                    if (!is_null) {
+                        non_audio_emitted++;
+                        ts->last_psi_output_bytes = ts->interleave_output_bytes;
+                    }
+                }
+            }
+
+            /* 1b) Synthetic-null spacer — when the SI buffer is empty (or
+             *    its front is a gated PSI), and we are about to emit video
+             *    this round, inject a null to guarantee every video chunk
+             *    is preceded by a non-video packet.  Without this, drains
+             *    triggered by single-stream overflow (buf_count > chunk*4)
+             *    emit chunk after chunk of same-PID video with no spacer,
+             *    producing 100+ packet runs of one PID on the wire and
+             *    pushing the receiver's video TBn past the 512 B Annex C
+             *    limit when UDP cadence is slightly irregular. */
+            if (!did_si) {
+                int any_video_pending = 0;
+                int k;
+                for (k = 0; k < s->nb_streams; k++) {
+                    MpegTSWriteStream *ts_st2 = s->streams[k]->priv_data;
+                    if (ts_st2 && ts_st2->interleave_buf_count > 0 &&
+                        s->streams[k]->codecpar->codec_type ==
+                            AVMEDIA_TYPE_VIDEO) {
+                        any_video_pending = 1;
+                        break;
+                    }
+                }
+                if (any_video_pending) {
+                    uint8_t null_pkt[TS_PACKET_SIZE];
+                    null_pkt[0] = SYNC_BYTE;
+                    null_pkt[1] = (NULL_PID >> 8) & 0x1F;
+                    null_pkt[2] = NULL_PID & 0xFF;
+                    null_pkt[3] = 0x10;  /* payload-only, cc=0 */
+                    memset(null_pkt + 4, STUFFING_BYTE, TS_PACKET_SIZE - 4);
+                    interleave_write_raw(s, null_pkt);
+                    /* Keep total_size in sync with interleave_output_bytes:
+                     * both now include this null. */
+                    ts->total_size += TS_PACKET_SIZE;
+                    emitted_this_round++;
+                    /* Do NOT count towards non_audio_emitted — a null alone
+                     * is not a valid audio-spacing partner per H.222.0
+                     * Annex D (audio still needs SI or video in the round). */
+                }
+            }
+        }
+
+        /* 2) Video packets — up to `chunk` per round from each video
+         *    stream.  Video Rxn (≥ 24 Mbps for H.264 High 4.0) exceeds
+         *    muxrate so TBn for video never accumulates; back-to-back
+         *    emission is T-STD-safe. */
+        for (i = 0; i < s->nb_streams; i++) {
+            MpegTSWriteStream *ts_st = s->streams[i]->priv_data;
+            int emit, j;
+            if (!ts_st || ts_st->interleave_buf_count == 0)
+                continue;
+            if (s->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+                continue;
+            emit = FFMIN(chunk, ts_st->interleave_buf_count);
+            for (j = 0; j < emit; j++) {
+                interleave_write_raw(s, ts_st->interleave_buf);
+                ts_st->interleave_buf_count--;
+                if (ts_st->interleave_buf_count > 0)
+                    memmove(ts_st->interleave_buf,
+                            ts_st->interleave_buf + TS_PACKET_SIZE,
+                            (int64_t)ts_st->interleave_buf_count * TS_PACKET_SIZE);
+                total--;
+                emitted_this_round++;
+                non_audio_emitted++;
+            }
+        }
+
+        /* 3) Audio — emit at most ONE packet per audio stream, but only
+         *    if at least one non-audio packet (SI or video) was emitted
+         *    in this round.  This is what enforces H.222.0 Annex D T-STD
+         *    compliance: without this guard, once the SI and video buffers
+         *    deplete mid-drain, subsequent rounds would emit only leftover
+         *    audio, producing back-to-back same-PID packets at wire rate
+         *    (63.2 µs at 23.8 Mbps).  For AAC 5.1 with Rxn = 5.53 Mbps
+         *    (Annex Q: 1.2 × 576 kbps × 8 ch), consecutive same-PID packets
+         *    need ≥ 266 µs of separation or TBn grows past the 512 B limit
+         *    (TR 101 290 P3.3 Buffer_error).
+         *
+         *    When we break out of this loop with audio still buffered, the
+         *    audio remains in its per-stream buffer and drains on the next
+         *    drain call — which runs at the next AVPacket arrival, and by
+         *    then either new video has been buffered (restoring spacing)
+         *    or the single-stream threshold will re-fire this path. */
+        /* Audio guard: audio packets emit only when interleaved with
+         * non-audio content (SI/video) in the same round.  This enforces
+         * the H.222.0 Annex D T-STD spacing requirement for per-PID
+         * transport buffers (TBn) — consecutive same-PID audio packets
+         * at wire rate overflow TBn (512 B limit) because the per-codec
+         * Rxn drain rate is well below mux_rate.  When no non-audio
+         * packet was emitted this round, skip audio — the audio stays
+         * buffered for a future drain with non-audio content.  We do NOT
+         * break the drain: SI content (particularly null packets that
+         * implement CBR padding in interleave mode) must keep flowing,
+         * or the SI buffer grows unboundedly. */
+        if (non_audio_emitted == 0)
+            goto end_round;
+
+        for (i = 0; i < s->nb_streams; i++) {
+            MpegTSWriteStream *ts_st = s->streams[i]->priv_data;
+            if (!ts_st || ts_st->interleave_buf_count == 0)
+                continue;
+            if (s->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+                continue;
+            interleave_write_raw(s, ts_st->interleave_buf);
+            ts_st->interleave_buf_count--;
+            if (ts_st->interleave_buf_count > 0)
+                memmove(ts_st->interleave_buf,
+                        ts_st->interleave_buf + TS_PACKET_SIZE,
+                        (int64_t)ts_st->interleave_buf_count * TS_PACKET_SIZE);
+            total--;
+            emitted_this_round++;
+        }
+
+end_round:
+        /* Safety: if nothing was emitted this round, break to avoid infinite loop */
+        if (emitted_this_round == 0)
+            break;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+
 static int64_t get_pcr(const MpegTSWrite *ts)
 {
     return av_rescale(ts->total_size + 11, 8 * PCR_TIME_BASE, ts->mux_rate) +
@@ -972,6 +2014,57 @@ static int64_t get_pcr(const MpegTSWrite *ts)
 static void write_packet(AVFormatContext *s, const uint8_t *packet)
 {
     MpegTSWrite *ts = s->priv_data;
+
+    /* When interleave buffering is active, enqueue instead of writing.
+     * total_size is still advanced so that get_pcr() returns correct
+     * values for subsequent packets within the same PES. */
+    if (ts->ts_interleave && ts->interleave_buffering) {
+        interleave_enqueue(s, packet);
+        ts->total_size += TS_PACKET_SIZE;
+        return;
+    }
+
+    /* CBR output pacing: pace each TS packet to maintain constant bitrate.
+     * Uses the same fair-spinning pattern as the IPMX USB sender:
+     * coarse-sleep all but the last CBR_PACE_SPIN_US, then busy-spin
+     * for sub-millisecond precision.  This prevents burst delivery on UDP
+     * and ensures TS packets are sent at a rate matching the declared
+     * muxrate.  Without this, the muxer emits all packets for a frame in
+     * one burst, then pauses until the next frame — causing receiver buffer
+     * overflow on systems with limited de-jitter capacity. */
+    if (ts->cbr_pacing && ts->mux_rate > 1) {
+        int64_t now_us, target_us, wait;
+
+        now_us = av_gettime_relative();
+
+        if (ts->pacing_start_us == 0)
+            ts->pacing_start_us = now_us;
+
+        /* Pacing target derived from total_size — the same byte counter
+         * that drives PCR (see get_pcr()).  This guarantees the pacing
+         * clock and the PCR clock are locked: zero cumulative drift.
+         *
+         * target = epoch + total_size * 8 / mux_rate  (in microseconds)
+         */
+        target_us = ts->pacing_start_us +
+                    av_rescale(ts->total_size, 8000000LL, ts->mux_rate);
+        wait = target_us - now_us;
+
+        if (wait > 0 && wait <= CBR_PACE_MAX_EARLY_US) {
+            /* Coarse sleep for the bulk of the wait */
+            if (wait > CBR_PACE_SPIN_US)
+                av_usleep((unsigned)(wait - CBR_PACE_SPIN_US));
+            /* Busy-spin the last fraction for precision */
+            while (av_gettime_relative() < target_us)
+                spin_hint();
+        }
+        /* If wait <= 0: we're behind schedule (demux seek stall, OS
+         * scheduling delay).  Send immediately — the constant-rate
+         * pacing will naturally re-converge as total_size advances.
+         * If wait > CBR_PACE_MAX_EARLY_US: startup transient or clock
+         * discontinuity — also send immediately and let it converge. */
+    }
+
     if (ts->m2ts_mode) {
         int64_t pcr = get_pcr(s->priv_data);
         uint32_t tp_extra_header = pcr % 0x3fffffff;
@@ -981,6 +2074,17 @@ static void write_packet(AVFormatContext *s, const uint8_t *packet)
     }
     avio_write(s->pb, packet, TS_PACKET_SIZE);
     ts->total_size += TS_PACKET_SIZE;
+
+    /* When interleave mode is active, packets can reach this non-buffered path
+     * (e.g., CBR gap-fill null packets inserted before a PES arrives at a
+     * stream-loop boundary).  interleave_output_bytes must track the actual
+     * avio byte position so that PCR rewrites performed later by
+     * interleave_write_raw() reflect the true file-byte position of
+     * drained PCR-carrying packets.  Without this, every direct-written
+     * packet shifts all subsequent drained PCRs by 188 * 8 / mux_rate
+     * (~63 µs at 23.8 Mbps), producing P2.4 PCR_accuracy_error. */
+    if (ts->ts_interleave)
+        ts->interleave_output_bytes += TS_PACKET_SIZE;
 }
 
 static void section_write_packet(MpegTSSection *s, const uint8_t *packet)
@@ -1187,6 +2291,17 @@ static int mpegts_init(AVFormatContext *s)
             return AVERROR(ENOMEM);
         }
 
+        /* Allocate interleave buffer if ts_interleave is enabled */
+        if (ts->ts_interleave) {
+            int initial_cap = (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+                              ? 2048 : 128;
+            ts_st->interleave_buf = av_malloc((int64_t)initial_cap * TS_PACKET_SIZE);
+            if (!ts_st->interleave_buf)
+                return AVERROR(ENOMEM);
+            ts_st->interleave_buf_capacity = initial_cap;
+            ts_st->interleave_buf_count = 0;
+        }
+
         /* MPEG pid values < 16 are reserved. Applications which set st->id in
          * this range are assigned a calculated pid. */
         if (st->id < 16) {
@@ -1288,6 +2403,7 @@ static int mpegts_init(AVFormatContext *s)
     ts->last_sdt_ts = AV_NOPTS_VALUE;
     ts->last_nit_ts = AV_NOPTS_VALUE;
     ts->pat_period = av_rescale(ts->pat_period_us, PCR_TIME_BASE, AV_TIME_BASE);
+    ts->pat_min_gap = av_rescale(ts->pat_min_gap_us, PCR_TIME_BASE, AV_TIME_BASE);
     ts->sdt_period = av_rescale(ts->sdt_period_us, PCR_TIME_BASE, AV_TIME_BASE);
     ts->nit_period = av_rescale(ts->nit_period_us, PCR_TIME_BASE, AV_TIME_BASE);
 
@@ -1310,6 +2426,76 @@ static int mpegts_init(AVFormatContext *s)
     if (ts->flags & MPEGTS_FLAG_NIT)
         av_log(s, AV_LOG_VERBOSE, ", nit every %"PRId64" ms", av_rescale(ts->nit_period, 1000, PCR_TIME_BASE));
     av_log(s, AV_LOG_VERBOSE, "\n");
+
+    /* PEP encryption initialization.
+     * Check both muxer private data (ts->pep_psk) and AVFormatContext (s->pep_psk)
+     * since the option may be set on either depending on how the CLI routes it. */
+    {
+        const char *psk = (ts->pep_psk && ts->pep_psk[0]) ? ts->pep_psk :
+                          (s->pep_psk && s->pep_psk[0]) ? s->pep_psk : NULL;
+        const char *mode = ts->pep_mode ? ts->pep_mode : s->pep_mode;
+        const char *iv = ts->pep_iv ? ts->pep_iv : s->pep_iv;
+        const char *kg = ts->pep_key_generator ? ts->pep_key_generator : s->pep_key_generator;
+        const char *kv = ts->pep_key_version ? ts->pep_key_version : s->pep_key_version;
+
+    if (psk) {
+        RtpPepContext *pep_ctx = av_mallocz(sizeof(*pep_ctx));
+        if (!pep_ctx)
+            return AVERROR(ENOMEM);
+        if (rtp_pep_init(pep_ctx, s, psk, mode, iv, kg, kv, s->pep_rtp_kv) < 0 ||
+            av_ipmx_pep_mode_has_cmac(pep_ctx->mode)) {
+            if (av_ipmx_pep_mode_has_cmac(pep_ctx->mode))
+                av_log(s, AV_LOG_ERROR, "PEP: CMAC modes not supported for MPEG2-TS over UDP\n");
+
+            av_free(pep_ctx);
+            return AVERROR(EINVAL);
+        }
+        ts->pep_context = pep_ctx;
+        ts->pep_input_ctr = 0;
+        ts->pep_key_ver = pep_ctx->key_version;
+        /* Wire kv_rotate for MPEG2-TS (boundary = is_start PES packet) */
+        if (s->pep_kv_rotate > 0 && s->pep_rtp_kv) {
+            pep_ctx->kv_rotate_slices = s->pep_kv_rotate;
+            av_log(s, AV_LOG_INFO, "MPEG-TS PEP key rotation every %d PES boundaries\n",
+                   pep_ctx->kv_rotate_slices);
+        }
+        av_log(s, AV_LOG_INFO, "MPEG-TS PEP encryption enabled\n");
+    }
+    }
+
+    /* Allocate shared SI interleave buffer */
+    if (ts->ts_interleave) {
+        int si_cap = 512;
+        ts->interleave_si_buf = av_malloc((int64_t)si_cap * TS_PACKET_SIZE);
+        if (!ts->interleave_si_buf)
+            return AVERROR(ENOMEM);
+        ts->interleave_si_capacity = si_cap;
+        ts->interleave_si_count = 0;
+        ts->interleave_output_bytes = 0;
+        ts->last_psi_output_bytes = INT64_MIN / 2;
+    }
+
+    if (ts->cbr_pacing_threaded) {
+        int ret;
+        if (!ts->cbr_pacing) {
+            av_log(s, AV_LOG_ERROR,
+                   "cbr_pacing_threaded requires cbr_pacing=1\n");
+            return AVERROR(EINVAL);
+        }
+        /* Disable libavformat's per-packet FLUSH_POINT marker.  In
+         * threaded mode the output thread fills the avio buffer
+         * asynchronously, so a flush-after-each-muxer-write_packet
+         * cuts UDP datagrams into partials mid-accumulation.  Only
+         * override the auto default (-1); respect explicit user
+         * choices of 0 or 1. */
+        if (s->flush_packets == -1)
+            s->flush_packets = 0;
+        if ((ret = mpegts_out_thread_start(s)) < 0) {
+            av_log(s, AV_LOG_ERROR,
+                   "failed to start mpegts output thread: %d\n", ret);
+            return ret;
+        }
+    }
 
     return 0;
 }
@@ -1496,14 +2682,24 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
     MpegTSWrite *ts = s->priv_data;
     uint8_t buf[TS_PACKET_SIZE];
     uint8_t *q;
-    int val, is_start, len, header_len, write_pcr, flags;
+    int val, is_start, is_start_saved, len, header_len, write_pcr, flags;
     int afc_len, stuffing_len;
     int is_dvb_subtitle = (st->codecpar->codec_id == AV_CODEC_ID_DVB_SUBTITLE);
     int is_dvb_teletext = (st->codecpar->codec_id == AV_CODEC_ID_DVB_TELETEXT);
     int64_t delay = av_rescale(s->max_delay, 90000, AV_TIME_BASE);
     int force_pat = st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && key && !ts_st->prev_payload_key;
+    /* TR 101 290 P3.2: minimum SI repetition interval (25 ms by spec).
+     * Suppress force_pat if we sent PAT/PMT less than pat_min_gap ago
+     * to avoid violating the minimum repetition rate. The floor is
+     * configurable via -pat_min_gap (default 25 ms) so deployments with
+     * jittery network paths can raise it for arrival-side robustness. */
     int force_sdt = 0;
     int force_nit = 0;
+    if (force_pat && ts->last_pat_ts != AV_NOPTS_VALUE) {
+        int64_t pcr_now = get_pcr(ts);
+        if (pcr_now - ts->last_pat_ts < ts->pat_min_gap)
+            force_pat = 0;
+    }
 
     av_assert0(ts_st->payload != buf || st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO);
     if (ts->flags & MPEGTS_FLAG_PAT_PMT_AT_FRAMES && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -1518,6 +2714,7 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
     }
 
     is_start = 1;
+    is_start_saved = 0;
     while (payload_size > 0) {
         int64_t pcr = AV_NOPTS_VALUE;
         if (ts->mux_rate > 1)
@@ -1606,6 +2803,29 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
             if (dts != AV_NOPTS_VALUE && dts < pcr / SYSTEM_CLOCK_FREQUENCY_DIVISOR)
                 av_log(s, AV_LOG_WARNING, "dts < pcr, TS is invalid\n");
             extend_af(buf, write_pcr_bits(q, pcr));
+            q = get_ts_payload_start(buf);
+        }
+        /* PEP: insert CTR header into adaptation field private data.
+         * Only for data PES streams with eligible PIDs.
+         * The extend_af shifts data, reducing available payload space;
+         * the stuffing logic at packet end handles the remaining space. */
+        if (ts->pep_context && ts_st->pid >= 0x0010 && ts_st->pid <= 0x1ffe) {
+            int pep_pcr_sz = (buf[3] & 0x20 && buf[4] > 0 && (buf[5] & 0x10)) ? 6 : 0;
+            set_af_flag(buf, 0x02); /* transport_private_data_flag */
+            if (is_start) {
+                /* Full header: private_data_length(1) + key_version(4) + input_ctr(8) */
+                buf[6 + pep_pcr_sz] = 12;
+                AV_WB32(buf + 6 + pep_pcr_sz + 1, ts->pep_key_ver);
+                AV_WB64(buf + 6 + pep_pcr_sz + 5, ts->pep_input_ctr);
+                extend_af(buf, 1 + 12);
+            } else {
+                /* Short header: private_data_length(1) + input_ctr_short(3) */
+                buf[6 + pep_pcr_sz] = 3;
+                buf[6 + pep_pcr_sz + 1] = (ts->pep_input_ctr >> 16) & 0xFF;
+                buf[6 + pep_pcr_sz + 2] = (ts->pep_input_ctr >> 8) & 0xFF;
+                buf[6 + pep_pcr_sz + 3] = ts->pep_input_ctr & 0xFF;
+                extend_af(buf, 1 + 3);
+            }
             q = get_ts_payload_start(buf);
         }
         if (is_start) {
@@ -1729,6 +2949,7 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
                 *q++ = len >> 8;
                 *q++ = len;
             }
+            is_start_saved = 1; /* remember that this TS packet starts a new PES */
             is_start = 0;
         }
         /* header size */
@@ -1769,6 +2990,44 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
 
         payload      += len;
         payload_size -= len;
+
+        /* PEP: encrypt payload portion of TS packet */
+        if (ts->pep_context && ts_st->pid >= 0x0010 && ts_st->pid <= 0x1ffe) {
+            RtpPepContext *pep = (RtpPepContext *)ts->pep_context;
+            int hdr_size = buf[4] + 1 + 4; /* adaptation_field_length + 1 + 4-byte TS header */
+            int payload_len = TS_PACKET_SIZE - hdr_size;
+
+            /* KV rotation: if pending and at a PES start boundary, rotate now */
+            if (pep->kv_rotate_pending && is_start_saved) {
+                uint8_t kv_bytes[4];
+                int key_bits = av_ipmx_pep_mode_key_bits(pep->mode);
+                pep->key_version = (pep->key_version + 1) & 0xFFFFFFFF;
+                AV_WB32(kv_bytes, pep->key_version);
+                av_ipmx_pep_derive_key(pep->psk, pep->psk_len,
+                                        pep->key_generator, kv_bytes,
+                                        pep->key, key_bits);
+                ts->pep_key_ver = pep->key_version;
+                pep->kv_rotate_pending = 0;
+                pep->kv_slices_since_rotate = 0;
+                av_log(s, AV_LOG_INFO, "PEP: key_version rotated to %08x\n",
+                       pep->key_version);
+            }
+
+            if (payload_len > 0) {
+                av_ipmx_pep_aes_ctr(pep->key, pep->key_len, pep->iv_prime,
+                                     ts->pep_input_ctr,
+                                     buf + hdr_size, buf + hdr_size, payload_len);
+                ts->pep_input_ctr += av_ipmx_pep_ctr_advance(payload_len);
+                /* Count slices and arm rotation */
+                if (pep->kv_rotate_slices > 0) {
+                    pep->kv_slices_since_rotate += av_ipmx_pep_ctr_advance(payload_len);
+                    if (pep->kv_slices_since_rotate >= pep->kv_rotate_slices)
+                        pep->kv_rotate_pending = 1;
+                }
+            }
+            is_start_saved = 0;
+        }
+
         write_packet(s, buf);
     }
     ts_st->prev_payload_key = key;
@@ -1891,6 +3150,31 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
     if (!ts->first_dts_checked && dts != AV_NOPTS_VALUE) {
         ts->first_pcr += dts * SYSTEM_CLOCK_FREQUENCY_DIVISOR;
         ts->first_dts_checked = 1;
+    }
+
+    /* CBR gap fill: if the muxer was idle (e.g., during a -stream_loop
+     * seek), wall clock has advanced but no TS packets were emitted.
+     * Fill the gap with null packets to maintain continuous CBR output.
+     * Without this, the muxer bursts to catch up after the idle period,
+     * which can overflow the UDP socket buffer and lose a packet (CC error).
+     *
+     * Each null packet goes through write_packet() which applies CBR
+     * pacing, so they are spaced at the correct bitrate interval. */
+    if (ts->cbr_pacing && ts->mux_rate > 1 && ts->pacing_start_us > 0) {
+        int64_t now_us = av_gettime_relative();
+        int64_t target_bytes = av_rescale(now_us - ts->pacing_start_us,
+                                          ts->mux_rate, 8000000LL);
+        int64_t gap_bytes = target_bytes - ts->total_size;
+        /* Only fill if we're behind by more than a few packets
+         * (small gaps self-correct; large gaps need null fill) */
+        if (gap_bytes > TS_PACKET_SIZE * 4) {
+            int max_fill = gap_bytes / TS_PACKET_SIZE;
+            /* Cap to prevent runaway fill on startup or clock jumps */
+            if (max_fill > 10000)
+                max_fill = 0; /* too large — clock discontinuity, skip */
+            while (max_fill-- > 0)
+                mpegts_insert_null_packet(s);
+        }
     }
 
     if (ts->copyts < 1) {
@@ -2199,18 +3483,47 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
         }
         av_free(hdr);
     } else if (st->codecpar->codec_id == AV_CODEC_ID_PCM_BLURAY && ts->m2ts_mode) {
+        if (ts->ts_interleave) ts->interleave_buffering = 1;
         mpegts_write_pes(s, st, buf, size, pts, dts,
                          pkt->flags & AV_PKT_FLAG_KEY, stream_id);
+        if (ts->ts_interleave) ts->interleave_buffering = 0;
         return 0;
+    }
+
+    /* When interleaving is enabled, drain when BOTH video and audio data
+     * are buffered.  This ensures we accumulate packets from the current
+     * stream, and drain only once we have data from multiple streams to
+     * interleave.  For a typical V,V,V,...,A,V,V,...,A pattern from the
+     * DTS interleaver, this drains at each audio arrival, interleaving
+     * the accumulated video + null packets with audio. */
+    if (ts->ts_interleave) {
+        int have_video = 0, have_audio = 0;
+        int i;
+        for (i = 0; i < s->nb_streams; i++) {
+            MpegTSWriteStream *ts_st2 = s->streams[i]->priv_data;
+            if (ts_st2 && ts_st2->interleave_buf_count > 0) {
+                if (s->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+                    have_video = 1;
+                else
+                    have_audio = 1;
+            }
+        }
+        /* Drain when we have both video and audio, or when the current
+         * stream already has a large buffer (fallback for single-stream) */
+        if ((have_video && have_audio) ||
+            ts_st->interleave_buf_count > ts->ts_interleave_chunk * 4)
+            interleave_drain(s);
     }
 
     if (ts_st->payload_size && (ts_st->payload_size + size > ts->pes_payload_size ||
         (dts != AV_NOPTS_VALUE && ts_st->payload_dts != AV_NOPTS_VALUE &&
          dts - ts_st->payload_dts >= max_audio_delay) ||
         ts_st->opus_queued_samples + opus_samples >= 5760 /* 120ms */)) {
+        if (ts->ts_interleave) ts->interleave_buffering = 1;
         mpegts_write_pes(s, st, ts_st->payload, ts_st->payload_size,
                          ts_st->payload_pts, ts_st->payload_dts,
                          ts_st->payload_flags & AV_PKT_FLAG_KEY, stream_id);
+        if (ts->ts_interleave) ts->interleave_buffering = 0;
         ts_st->payload_size = 0;
         ts_st->opus_queued_samples = 0;
     }
@@ -2218,8 +3531,10 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
     if (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO || size > ts->pes_payload_size) {
         av_assert0(!ts_st->payload_size);
         // for video and subtitle, write a single pes packet
+        if (ts->ts_interleave) ts->interleave_buffering = 1;
         mpegts_write_pes(s, st, buf, size, pts, dts,
                          pkt->flags & AV_PKT_FLAG_KEY, stream_id);
+        if (ts->ts_interleave) ts->interleave_buffering = 0;
         ts_st->opus_queued_samples = 0;
         av_free(data);
         return 0;
@@ -2250,13 +3565,19 @@ static void mpegts_write_flush(AVFormatContext *s)
         AVStream *st = s->streams[i];
         MpegTSWriteStream *ts_st = st->priv_data;
         if (ts_st->payload_size > 0) {
+            if (ts->ts_interleave) ts->interleave_buffering = 1;
             mpegts_write_pes(s, st, ts_st->payload, ts_st->payload_size,
                              ts_st->payload_pts, ts_st->payload_dts,
                              ts_st->payload_flags & AV_PKT_FLAG_KEY, -1);
+            if (ts->ts_interleave) ts->interleave_buffering = 0;
             ts_st->payload_size = 0;
             ts_st->opus_queued_samples = 0;
         }
     }
+
+    /* Final drain of any remaining interleave-buffered packets */
+    if (ts->ts_interleave)
+        interleave_drain(s);
 
     if (ts->m2ts_mode) {
         int packets = (avio_tell(s->pb) / (TS_PACKET_SIZE + 4)) % 32;
@@ -2280,6 +3601,10 @@ static int mpegts_write_end(AVFormatContext *s)
     if (s->pb)
         mpegts_write_flush(s);
 
+    /* Drain and stop the output thread after the mux thread has pushed
+     * the trailing buffered content into the ring. */
+    mpegts_out_thread_stop(s);
+
     return 0;
 }
 
@@ -2289,12 +3614,16 @@ static void mpegts_deinit(AVFormatContext *s)
     MpegTSService *service;
     int i;
 
+    /* Safety net: stop the thread if write_end didn't (e.g. error path). */
+    mpegts_out_thread_stop(s);
+
     for (i = 0; i < s->nb_streams; i++) {
         AVStream *st = s->streams[i];
         MpegTSWriteStream *ts_st = st->priv_data;
         if (ts_st) {
             av_freep(&ts_st->dvb_ac3_desc);
             av_freep(&ts_st->payload);
+            av_freep(&ts_st->interleave_buf);
             if (ts_st->amux) {
                 avformat_free_context(ts_st->amux);
                 ts_st->amux = NULL;
@@ -2307,6 +3636,7 @@ static void mpegts_deinit(AVFormatContext *s)
         av_freep(&service);
     }
     av_freep(&ts->services);
+    av_freep(&ts->interleave_si_buf);
 }
 
 static int mpegts_check_bitstream(AVFormatContext *s, AVStream *st,
@@ -2389,10 +3719,44 @@ static const AVOption options[] = {
     { "tables_version", "set PAT, PMT, SDT and NIT version", OFFSET(tables_version), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 31, ENC },
     { "omit_video_pes_length", "Omit the PES packet length for video packets",
       OFFSET(omit_video_pes_length), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, ENC },
+    { "cbr_pacing", "Pace TS packet output to match muxrate (for CBR UDP streaming)",
+      OFFSET(cbr_pacing), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "cbr_pacing_threaded", "Pace output in a dedicated thread fed by a ring "
+                             "buffer; absorbs mux-thread scheduling stalls and "
+                             "emits at strict per-packet-duration spacing to "
+                             "avoid downstream T-STD TBn overflow. Requires "
+                             "cbr_pacing=1.",
+      OFFSET(cbr_pacing_threaded), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "cbr_pacing_spin", "Threaded pacer only: pure busy-spin between emits "
+                         "instead of sleep+tail-spin.  Burns one CPU core at "
+                         "100% for maximum timing precision; useful on RT "
+                         "kernels with isolated cores.  Default 0 (sleep+"
+                         "spin, which is kinder to the scheduler and — on a "
+                         "standard Linux kernel — empirically produces "
+                         "fewer late events too).",
+      OFFSET(cbr_pacing_spin), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "ts_interleave", "Interleave audio/video TS packets (0=off, 1=null-interleave, 2=full-interleave)",
+      OFFSET(ts_interleave), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, ENC },
+    { "ts_interleave_chunk", "Video TS packets per interleave round (used by ts_interleave=1 and =2). "
+                              "Default 7 = exactly one full UDP datagram of pure video at pkt_size=1316, "
+                              "which empirically gives the lowest worst-case video T-STD TBn peak.",
+      OFFSET(ts_interleave_chunk), AV_OPT_TYPE_INT, { .i64 = 7 }, 1, 256, ENC },
+    { "pep_psk", "PEP pre-shared key (hex) for MPEG-TS encryption",
+      OFFSET(pep_psk), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
+    { "pep_mode", "PEP cipher mode (e.g. AES-128-CTR)",
+      OFFSET(pep_mode), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
+    { "pep_iv", "PEP base IV (hex)",
+      OFFSET(pep_iv), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
+    { "pep_key_generator", "PEP key generator (hex)",
+      OFFSET(pep_key_generator), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
+    { "pep_key_version", "PEP key version (hex)",
+      OFFSET(pep_key_version), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
     { "pcr_period", "PCR retransmission time in milliseconds",
       OFFSET(pcr_period_ms), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, ENC },
     { "pat_period", "PAT/PMT retransmission time limit in seconds",
       OFFSET(pat_period_us), AV_OPT_TYPE_DURATION, { .i64 = PAT_RETRANS_TIME * 1000LL }, 0, INT64_MAX, ENC },
+    { "pat_min_gap", "Minimum interval between PAT/PMT sections (TR 101 290 P3.2 floor)",
+      OFFSET(pat_min_gap_us), AV_OPT_TYPE_DURATION, { .i64 = 25000 }, 0, 500000, ENC },
     { "sdt_period", "SDT retransmission time limit in seconds",
       OFFSET(sdt_period_us), AV_OPT_TYPE_DURATION, { .i64 = SDT_RETRANS_TIME * 1000LL }, 0, INT64_MAX, ENC },
     { "nit_period", "NIT retransmission time limit in seconds",

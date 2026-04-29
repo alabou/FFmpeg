@@ -184,7 +184,8 @@ static int aac_parse_packet(AVFormatContext *ctx, PayloadContext *data,
                             int flags)
 {
     int ret;
-
+    RTPDemuxContext* s = ctx->parent.d;
+    int cipher_flags = 0;
 
     if (!buf) {
         if (data->cur_au_index > data->nb_au_headers) {
@@ -216,6 +217,31 @@ static int aac_parse_packet(AVFormatContext *ctx, PayloadContext *data,
         av_log(ctx, AV_LOG_ERROR, "Error parsing AU headers\n");
         return -1;
     }
+
+    #pragma GCC diagnostic ignored "-Wdiscarded-qualifiers"
+
+    if (flags & RTP_FLAG_EXTHDRFULL) cipher_flags |= AVCIPHERCB_VALIDPARAM | AVCIPHERCB_VALIDINPUTCTR;
+
+    if (s && s->privacy_cipher) {
+        // s->pfnPrivacyDecrypt(s->privacy_context, s->privacy_context_size, s->encryption_stream_ctr, s->encryption_input_ctr, len, buf, buf, data->au_headers_length_bytes + 2, AV_CODEC_ID_AAC); // in-place
+        if (s->privacy_cipher->callback(s->privacy_cipher->opaque,
+                s->encryption_stream_ctr, s->encryption_input_ctr,
+                buf + data->au_headers_length_bytes + 2,
+                len - data->au_headers_length_bytes - 2, cipher_flags) < 0)
+            return AVERROR_INVALIDDATA; // in-place
+    }
+    len -= s->privacy_mac_size;
+
+    if (s && s->hdcp_cipher) {
+        // s->pfnHdcpDecrypt(s->hdcp_context, s->hdcp_context_size, s->encryption_stream_ctr, s->encryption_input_ctr, len, buf, buf, data->au_headers_length_bytes + 2, AV_CODEC_ID_AAC); // in-place
+        if (s->hdcp_cipher->callback(s->hdcp_cipher->opaque,
+                s->encryption_stream_ctr, s->encryption_input_ctr,
+                buf + data->au_headers_length_bytes + 2,
+                len - data->au_headers_length_bytes - 2, cipher_flags) < 0)
+            return AVERROR_INVALIDDATA; // in-place
+    }
+
+    s->encryption_current_ctr = s->encryption_input_ctr + ((len - data->au_headers_length_bytes - 2) & 15) ? ((len - data->au_headers_length_bytes - 2) >> 4) + 1 : ((len - data->au_headers_length_bytes - 2) >> 4); // once after both encryptions
 
     buf += data->au_headers_length_bytes + 2;
     len -= data->au_headers_length_bytes + 2;

@@ -53,6 +53,8 @@ static int mpegts_handle_packet(AVFormatContext *ctx, PayloadContext *data,
                                 int flags)
 {
     int ret;
+    RTPDemuxContext* s = ctx->parent.d;
+    int cipher_flags = 0;
 
     // We don't want to use the RTP timestamps at all. If the mpegts demuxer
     // doesn't set any pts/dts, the generic rtpdec code shouldn't try to
@@ -73,6 +75,27 @@ static int mpegts_handle_packet(AVFormatContext *ctx, PayloadContext *data,
         else
             return 0;
     }
+
+    #pragma GCC diagnostic ignored "-Wdiscarded-qualifiers"
+
+    if (flags & RTP_FLAG_EXTHDRFULL) cipher_flags |= AVCIPHERCB_VALIDPARAM | AVCIPHERCB_VALIDINPUTCTR;
+
+    if (s && s->privacy_cipher) {
+        if (s->privacy_cipher->callback(s->privacy_cipher->opaque,
+                s->encryption_stream_ctr, s->encryption_input_ctr, buf, len,
+                cipher_flags) < 0)
+            return AVERROR_INVALIDDATA; // in-place
+    }
+    len -= s->privacy_mac_size;
+
+    if (s && s->hdcp_cipher) {
+        if (s->hdcp_cipher->callback(s->hdcp_cipher->opaque,
+                s->encryption_stream_ctr, s->encryption_input_ctr, buf, len,
+                cipher_flags) < 0)
+            return AVERROR_INVALIDDATA; // in-place
+    }
+
+    s->encryption_current_ctr = s->encryption_input_ctr + ((len - 0) & 15) ? ((len - 0) >> 4) + 1 : ((len - 0) >> 4); // once after both encryptions
 
     ret = avpriv_mpegts_parse_packet(data->ts, pkt, buf, len);
     /* The only error that can be returned from avpriv_mpegts_parse_packet

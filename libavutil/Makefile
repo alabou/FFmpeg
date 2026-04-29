@@ -58,6 +58,7 @@ HEADERS = adler32.h                                                     \
           hwcontext_vulkan.h                                            \
           iamf.h                                                        \
           imgutils.h                                                    \
+          ipmx_pep.h                                                    \
           intfloat.h                                                    \
           intreadwrite.h                                                \
           lfg.h                                                         \
@@ -152,6 +153,7 @@ OBJS = adler32.o                                                        \
        hwcontext.o                                                      \
        iamf.o                                                           \
        imgutils.o                                                       \
+       ipmx_pep.o                                                       \
        integer.o                                                        \
        intmath.o                                                        \
        lfg.o                                                            \

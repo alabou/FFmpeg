@@ -204,6 +204,10 @@ https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/
 #define FMC_DESCRIPTOR               0x1f
 #define METADATA_DESCRIPTOR          0x26
 #define METADATA_STD_DESCRIPTOR      0x27
+#define AVC_VIDEO_DESCRIPTOR         0x28 /* H.222.0 § 2.6.64 Table 2-92 */
+#define AVC_TIMING_HRD_DESCRIPTOR    0x2a /* H.222.0 § 2.6.66 Table 2-93 */
+#define HEVC_VIDEO_DESCRIPTOR        0x38 /* H.222.0 § 2.6.95 Table 2-113 */
+#define HEVC_TIMING_HRD_DESCRIPTOR   0x39 /* H.222.0 § 2.6.97 Table 2-115 */
 #define EXTENSION_DESCRIPTOR         0x3f
 /* descriptor_tag values [0x40, 0xff] are User Private */
 
@@ -223,6 +227,7 @@ https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/
 #define AC3_DESCRIPTOR               0x6a /* AC-3_descriptor */
 #define ENHANCED_AC3_DESCRIPTOR      0x7a /* enhanced_AC-3_descriptor */
 #define DTS_DESCRIPTOR               0x7b
+#define AAC_DESCRIPTOR               0x7c /* AAC_descriptor (ETSI EN 300 468 §6.2.3.2) */
 #define DVB_EXTENSION_DESCRIPTOR     0x7f
 
 /* DVB descriptor_tag_extension values from

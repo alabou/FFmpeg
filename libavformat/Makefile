@@ -48,8 +48,11 @@ OBJS-$(CONFIG_RIFFDEC)                   += riffdec.o
 OBJS-$(CONFIG_RIFFENC)                   += riffenc.o
 OBJS-$(CONFIG_RTPDEC)                    += rdt.o                       \
                                             rtp.o                       \
+                                            rtp_cipher.o                \
+                                            rtp_pep.o                   \
                                             rtpdec.o                    \
                                             rtpdec_ac3.o                \
+                                            rtpdec_am824.o              \
                                             rtpdec_amr.o                \
                                             rtpdec_asf.o                \
                                             rtpdec_av1.o                \
@@ -527,7 +530,10 @@ OBJS-$(CONFIG_RSO_DEMUXER)               += rsodec.o rso.o pcm.o
 OBJS-$(CONFIG_RSO_MUXER)                 += rsoenc.o rso.o rawenc.o
 OBJS-$(CONFIG_RTP_MPEGTS_MUXER)          += rtpenc_mpegts.o
 OBJS-$(CONFIG_RTP_MUXER)                 += rtp.o         \
+                                            rtp_cipher.o     \
+                                            rtp_pep.o        \
                                             rtpenc_aac.o     \
+                                            rtpenc_am824.o   \
                                             rtpenc_latm.o    \
                                             rtpenc_amr.o     \
                                             rtpenc_av1.o     \
@@ -546,6 +552,8 @@ OBJS-$(CONFIG_RTP_MUXER)                 += rtp.o         \
 OBJS-$(CONFIG_RTSP_DEMUXER)              += rtsp.o rtspdec.o httpauth.o
 OBJS-$(CONFIG_RTSP_MUXER)                += rtsp.o rtspenc.o httpauth.o
 OBJS-$(CONFIG_S337M_DEMUXER)             += s337m.o spdif.o
+OBJS-$(CONFIG_AM824_DEMUXER)             += am824.o
+OBJS-$(CONFIG_AM824_MUXER)              += am824.o am824_s337m.o
 OBJS-$(CONFIG_SAMI_DEMUXER)              += samidec.o subtitles.o
 OBJS-$(CONFIG_SAP_DEMUXER)               += sapdec.o
 OBJS-$(CONFIG_SAP_MUXER)                 += sapenc.o

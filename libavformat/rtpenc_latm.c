@@ -22,6 +22,8 @@
 #include "avformat.h"
 #include "rtpenc.h"
 
+// For LATM encryption we consider that an RTP packet has a FULL ctr unless
+// we are using multiple RTP packets for one PayloadMux.
 void ff_rtp_send_latm(AVFormatContext *s1, const uint8_t *buff, int size)
 {
     /* MP4A-LATM
@@ -32,6 +34,7 @@ void ff_rtp_send_latm(AVFormatContext *s1, const uint8_t *buff, int size)
     int header_size;
     int offset = 0;
     int len    = 0;
+    int n = 0;
 
     /* skip ADTS header, if present */
     if ((s1->streams[0]->codecpar->extradata_size) == 0) {
@@ -47,15 +50,21 @@ void ff_rtp_send_latm(AVFormatContext *s1, const uint8_t *buff, int size)
     s->timestamp = s->cur_timestamp;
 
     /* PayloadMux() */
+    n = 0;
     while (size > 0) {
         len   = FFMIN(size, s->max_payload_size - (!offset ? header_size : 0));
         size -= len;
         if (!offset) {
             memcpy(s->buf + header_size, buff, len);
+            s1->payload_header_size = 0;
+            s1->full_ctr = (n == 0);
             ff_rtp_send_data(s1, s->buf, header_size + len, !size);
         } else {
+            s1->payload_header_size = 0;
+            s1->full_ctr = (n == 0);
             ff_rtp_send_data(s1, buff + offset, len, !size);
         }
         offset += len;
+        n += 1;
     }
 }

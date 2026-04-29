@@ -45,6 +45,8 @@ static int latm_parse_packet(AVFormatContext *ctx, PayloadContext *data,
                              int flags)
 {
     int ret, cur_len;
+    RTPDemuxContext* s = ctx->parent.d;
+    int cipher_flags = 0;
 
     if (buf) {
         if (!data->dyn_buf || data->timestamp != *timestamp) {
@@ -55,6 +57,28 @@ static int latm_parse_packet(AVFormatContext *ctx, PayloadContext *data,
             if ((ret = avio_open_dyn_buf(&data->dyn_buf)) < 0)
                 return ret;
         }
+
+        #pragma GCC diagnostic ignored "-Wdiscarded-qualifiers"
+
+        if (flags & RTP_FLAG_EXTHDRFULL) cipher_flags |= AVCIPHERCB_VALIDPARAM | AVCIPHERCB_VALIDINPUTCTR;
+
+        if (s && s->privacy_cipher) {
+            if (s->privacy_cipher->callback(s->privacy_cipher->opaque,
+                    s->encryption_stream_ctr, s->encryption_input_ctr, buf,
+                    len, cipher_flags) < 0)
+                return AVERROR_INVALIDDATA; // in-place
+        }
+        len -= s->privacy_mac_size;
+
+        if (s && s->hdcp_cipher) {
+            if (s->hdcp_cipher->callback(s->hdcp_cipher->opaque,
+                    s->encryption_stream_ctr, s->encryption_input_ctr, buf,
+                    len, cipher_flags) < 0)
+                return AVERROR_INVALIDDATA; // in-place
+        }
+
+        s->encryption_current_ctr = s->encryption_input_ctr + ((len - 0) & 15) ? ((len - 0) >> 4) + 1 : ((len - 0) >> 4); // once after both encryptions
+
         avio_write(data->dyn_buf, buf, len);
 
         if (!(flags & RTP_FLAG_MARKER))

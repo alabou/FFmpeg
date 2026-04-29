@@ -2263,6 +2263,13 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .long_name = NULL_IF_CONFIG_SMALL("PCM SGA"),
         .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSLESS,
     },
+    {
+        .id        = AV_CODEC_ID_AM824,
+        .type      = AVMEDIA_TYPE_AUDIO,
+        .name      = "am824",
+        .long_name = NULL_IF_CONFIG_SMALL("SMPTE ST 2110-31 AES3 Transparent Transport"),
+        .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSLESS,
+    },
 
     /* various ADPCM codecs */
     {
