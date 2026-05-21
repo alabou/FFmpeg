@@ -493,6 +493,16 @@ static void sdp_parse_line(AVFormatContext *s, SDPParseState *s1,
         break;
     case 's':
         av_dict_set(&s->metadata, "title", p, 0);
+        /* IPMX auto-detect (TR-10-1): the IPMX sample sender produces
+         * `s=IPMX media out`. If the user hasn't forced the flag, treat
+         * an IPMX session-name as a positive signal that SR NTP fields
+         * are encoded per §8.7 (MSW=unix sec, LSW=ns). */
+        if (s->ipmx < 0 && av_stristr(p, "IPMX")) {
+            s->ipmx = 1;
+            av_log(s, AV_LOG_VERBOSE,
+                   "IPMX auto-detected from SDP session name; "
+                   "SR NTP will be decoded per TR-10-1 §8.7\n");
+        }
         break;
     case 'i':
         if (s->nb_streams == 0) {
@@ -645,6 +655,42 @@ static void sdp_parse_line(AVFormatContext *s, SDPParseState *s1,
             } else {
                 s1->seen_fmtp = 1;
                 av_strlcpy(s1->delayed_fmtp, buf, sizeof(s1->delayed_fmtp));
+            }
+            /* IPMX fmtp marker — TR-10-1 §10 declares per-stream IPMX
+             * compliance via the standalone `IPMX` token in fmtp
+             * parameters (semicolon-separated, possibly whitespace-padded).
+             * Detect by scanning each token; a substring match would
+             * false-positive on e.g. an identifier ending in "IPMX". */
+            if (s->ipmx < 0) {
+                const char *q = buf;
+                while ((q = av_stristr(q, "IPMX")) != NULL) {
+                    int before_ok = (q == buf) ||
+                                    q[-1] == ' ' || q[-1] == ';' || q[-1] == '\t';
+                    char after = q[4];
+                    int after_ok = !after || after == ';' || after == ' ' ||
+                                   after == '\t' || after == '\r' || after == '\n';
+                    if (before_ok && after_ok) {
+                        s->ipmx = 1;
+                        av_log(s, AV_LOG_VERBOSE,
+                               "IPMX auto-detected from SDP fmtp 'IPMX' "
+                               "token; SR NTP will be decoded per "
+                               "TR-10-1 §8.7\n");
+                        break;
+                    }
+                    q += 4;
+                }
+            }
+        } else if (av_strstart(p, "ts-refclk:", &p) ||
+                   av_strstart(p, "mediaclk:", &p)) {
+            /* TR-10-1 §10.4 / §10.5: ts-refclk and mediaclk attributes are
+             * mandatory IPMX session signalling. Either marker is enough
+             * to flip the session flag. */
+            if (s->ipmx < 0) {
+                s->ipmx = 1;
+                av_log(s, AV_LOG_VERBOSE,
+                       "IPMX auto-detected from SDP %s; "
+                       "SR NTP will be decoded per TR-10-1 §8.7\n",
+                       buf);
             }
         } else if (av_strstart(p, "framerate:", &p) && s->nb_streams > 0) {
             // RFC 8866

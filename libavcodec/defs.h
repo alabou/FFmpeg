@@ -351,6 +351,25 @@ typedef struct AVRTCPSenderReport {
 } AVRTCPSenderReport;
 
 /**
+ * AM824 (SMPTE ST 2110-31) wire-content metadata published by the AM824
+ * encoder for downstream muxers / SDP writers.
+ *
+ * Exposed as AV_PKT_DATA_AM824_STREAM_INFO side data on
+ * AVCodecParameters::coded_side_data. The encoder populates it at init time
+ * from its channel count, -non_pcm flag, and -non_pcm_pairs bitmask;
+ * muxers (ipmx, rtp) consume it to write the matching channel-order in
+ * SDP fmtp and the corresponding AES3 audio MIB sample_size — without
+ * having to re-derive per-pair non-PCM state from their own AVOptions.
+ */
+typedef struct AVAM824StreamInfo {
+    uint8_t  sample_size_bits;   ///< AES3 channel-status word length: 16 (any non-PCM) or 24 (all PCM)
+    uint8_t  is_non_pcm;         ///< 1 if any pair carries S337M / IEC 61937 burst data
+    uint8_t  non_pcm_pairs_mask; ///< Per-pair bitmask: bit i = stereo pair i is non-PCM
+    uint8_t  reserved;           ///< Reserved (zero)
+    char     channel_order[32];  ///< SDP fmtp channel-order, e.g. "SMPTE2110.(ST,AES3)" (NUL-terminated)
+} AVAM824StreamInfo;
+
+/**
  * Encode extradata length to a buffer. Used by xiph codecs.
  *
  * @param s buffer to write to; must be at least (v/255+1) bytes long

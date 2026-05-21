@@ -434,6 +434,14 @@ extern const FFCodec ff_zmbv_decoder;
 /* audio codecs */
 extern const FFCodec ff_aac_encoder;
 extern const FFCodec ff_aac_decoder;
+/* Sender-side pseudo-decoder: takes AAC packets, emits S32 PCM samples
+ * carrying an IEC 61937 / S337m burst (downstream am824 encoder turns
+ * those into AES3 subframes for the wire). Declared HERE — i.e. after
+ * ff_aac_decoder — so that avcodec_find_decoder(AV_CODEC_ID_AAC) on the
+ * receive side iterates and returns the standard AAC decoder first;
+ * this wrap pseudo-decoder is only reachable via explicit
+ * `-c:a am824_s337m_wrap`. */
+extern const FFCodec ff_am824_s337m_wrap_decoder;
 extern const FFCodec ff_aac_fixed_decoder;
 extern const FFCodec ff_aac_latm_decoder;
 extern const FFCodec ff_ac3_encoder;

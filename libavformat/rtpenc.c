@@ -25,6 +25,7 @@
 #include "mux.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/random_seed.h"
 #include "libavutil/opt.h"
 
@@ -348,13 +349,46 @@ static int rtp_write_header(AVFormatContext *s1)
         }
         break;
     case AV_CODEC_ID_MJPEG:
-    case AV_CODEC_ID_BITPACKED:
-    case AV_CODEC_ID_RAWVIDEO:
         if (st->codecpar->width <= 0 || st->codecpar->height <= 0) {
             av_log(s1, AV_LOG_ERROR, "dimensions not set\n");
             return AVERROR(EINVAL);
         }
         break;
+    case AV_CODEC_ID_BITPACKED:
+    case AV_CODEC_ID_RAWVIDEO: {
+        const FFRFC4175Format *rfc4175;
+        if (st->codecpar->width <= 0 || st->codecpar->height <= 0) {
+            av_log(s1, AV_LOG_ERROR, "dimensions not set\n");
+            return AVERROR(EINVAL);
+        }
+        rfc4175 = ff_rfc4175_get_format(st->codecpar->codec_id,
+                                        st->codecpar->format);
+        if (!rfc4175) {
+            av_log(s1, AV_LOG_ERROR,
+                   "RFC 4175 RTP packetization does not support pixel "
+                   "format %s under codec %s. The rfc4175 packetizer "
+                   "expects pkt->data to already be in RFC 4175 wire "
+                   "format; choose a supported (codec, pix_fmt) pair "
+                   "from rtpenc_rfc4175.c (e.g. -c:v rawvideo "
+                   "-pix_fmt uyvy422 / rgb24, or -c:v bitpacked "
+                   "-pix_fmt yuv420p / yuv422p / yuv422p10 / yuv444p).\n",
+                   av_get_pix_fmt_name(st->codecpar->format),
+                   avcodec_get_name(st->codecpar->codec_id));
+            return AVERROR(EINVAL);
+        }
+        /* ST 2110-20 §6.2.5: 4:2:0 shall be progressive only. The yinc=2
+         * formats in the table are exactly the 4:2:0 family. */
+        if (rfc4175->yinc > 1 &&
+            st->codecpar->field_order != AV_FIELD_PROGRESSIVE) {
+            av_log(s1, AV_LOG_ERROR,
+                   "RFC 4175 / ST 2110-20: 4:2:0 sampling (%s) shall be "
+                   "transmitted progressive-only; interlaced field_order "
+                   "is not allowed (ST 2110-20 §6.2.5).\n",
+                   av_get_pix_fmt_name(st->codecpar->format));
+            return AVERROR(EINVAL);
+        }
+        break;
+        }
     case AV_CODEC_ID_VP9:
         if (s1->strict_std_compliance > FF_COMPLIANCE_EXPERIMENTAL) {
             av_log(s, AV_LOG_ERROR,

@@ -39,8 +39,11 @@
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavcodec/avcodec.h"
+#include "libavcodec/defs.h"
+#include "libavcodec/packet.h"
 #include "am824_s337m.h"
 #include "avformat.h"
+#include "avio_internal.h"
 #include "demux.h"
 #include "internal.h"
 #include "mux.h"
@@ -54,6 +57,23 @@
 #define AM824_V_BIT          0x01
 
 #define AM824_MAX_SIGNALS    40
+
+/* AES3 channel status block: 192 bits = 24 bytes, repeats every 192 frames.
+ * Mirrors libavcodec/am824enc.c so the muxer's per-signal AES3 framing is
+ * bit-identical to the single-stream encoder's framing. */
+#define AES3_BLOCK_FRAMES    192
+#define AES3_CHSTATUS_BYTES  24
+
+#define CS_BYTE0_PRO         0x01
+#define CS_BYTE0_NOT_PCM     0x02
+#define CS_BYTE0_FS_48K      (0x01 << 6)
+#define CS_BYTE0_FS_441K     (0x02 << 6)
+#define CS_BYTE0_FS_32K      (0x03 << 6)
+#define CS_BYTE0_FS_NOTIND   0x00
+#define CS_BYTE1_MODE_NOT_IND 0x00
+#define CS_BYTE1_MODE_STEREO 0x04
+#define CS_BYTE2_WORDLEN_24  (0x01 | (0x05 << 3))
+#define CS_BYTE2_WORDLEN_16  (0x04 << 3)
 
 /* =====================================================================
  *  DEMUXER
@@ -598,18 +618,106 @@ const FFInputFormat ff_am824_demuxer = {
  *  MUXER
  * ===================================================================== */
 
+/* CRC-8 over AES3 channel-status bytes 0-22 (polynomial 0xB8, LSB-first).
+ * Result is stored in byte 23. Bit-identical to am824enc.c's
+ * aes3_channel_status_crc(). */
+static uint8_t mux_aes3_chstatus_crc(const uint8_t *data, int len)
+{
+    uint8_t crc = 0xFF;
+    int i, bit_idx;
+    for (i = 0; i < len; i++) {
+        for (bit_idx = 0; bit_idx < 8; bit_idx++) {
+            int bit = (data[i] >> bit_idx) & 1;
+            int feedback = (crc & 1) ^ bit;
+            crc >>= 1;
+            if (feedback)
+                crc ^= 0xB8;
+        }
+    }
+    return crc;
+}
+
+/* Build one signal's AES3 channel-status block.
+ * Mirrors build_channel_status() in libavcodec/am824enc.c so multi-signal
+ * muxer output is bit-identical to single-stream encoder output. */
+static void mux_build_signal_chstatus(uint8_t cs[AES3_CHSTATUS_BYTES],
+                                      int sample_rate, int non_pcm)
+{
+    memset(cs, 0, AES3_CHSTATUS_BYTES);
+
+    cs[0] = CS_BYTE0_PRO;
+    if (non_pcm)
+        cs[0] |= CS_BYTE0_NOT_PCM;
+    switch (sample_rate) {
+    case 48000:  cs[0] |= CS_BYTE0_FS_48K;   break;
+    case 44100:  cs[0] |= CS_BYTE0_FS_441K;  break;
+    case 32000:  cs[0] |= CS_BYTE0_FS_32K;   break;
+    default:     cs[0] |= CS_BYTE0_FS_NOTIND; break;
+    }
+
+    /* Per S337 §6.2: non-PCM uses "not indicated"; PCM stereo pair uses
+     * stereophonic (each muxer signal is a 2-channel pair). */
+    cs[1] = non_pcm ? CS_BYTE1_MODE_NOT_IND : CS_BYTE1_MODE_STEREO;
+
+    /* Word length: per S337 §6.2, byte 2 reflects the highest S337M
+     * data_mode. IEC 61937 mode 0 (16-bit) is used for AAC/AC3/EAC3/DTS
+     * over AES3, so non-PCM streams set 16-bit. PCM streams use 24-bit
+     * to match the AM824 DATA24 carrier width. */
+    cs[2] = non_pcm ? CS_BYTE2_WORDLEN_16 : CS_BYTE2_WORDLEN_24;
+
+    cs[23] = mux_aes3_chstatus_crc(cs, 23);
+}
+
+/* Even parity over DATA24 and the C/U/V bits in PCUV. */
+static int mux_compute_parity(uint32_t data24, int cuv)
+{
+    int ones = __builtin_popcount(data24 & 0x00FFFFFF)
+             + __builtin_popcount(cuv & 0x07);
+    return ones & 1;
+}
+
 typedef struct AM824MuxContext {
     AVClass *class;
     int nsignals;               /**< Number of input streams = signal pairs */
     int sample_rate;
     int *is_nonpcm;             /**< Per-stream: 1 if non-PCM/SPDIF */
     int am824_passthrough;      /**< 1 if input is already AM824 (just write raw bytes) */
+    /* Per-signal AES3 framing state (192-frame block cycle) */
+    uint16_t framing_index[AM824_MAX_SIGNALS];
+    uint8_t  channel_status[AM824_MAX_SIGNALS][AES3_CHSTATUS_BYTES];
+    /* Per-signal child ADTS muxer for raw AAC streams. ffmpeg's `aac`
+     * encoder emits AAC AVPackets without ADTS framing, but IEC 61937-6
+     * requires ADTS-framed payloads inside the burst. We mirror
+     * mpegtsenc.c's pattern: allocate an `adts` child muxer per AAC
+     * stream, write each raw AAC packet through it (the muxer prepends
+     * the ADTS header), and capture the bytes via avio_open/close_dyn_buf.
+     * NULL for non-AAC streams or when the upstream is already ADTS. */
+    AVFormatContext *adts_amux[AM824_MAX_SIGNALS];
+    AVPacket *adts_tmp_pkt;     /**< Reusable scratch packet for amux dispatch */
     /* Buffering for true interleaving: one pending frame per stream */
     AVPacket **pending;         /**< One buffered packet per stream */
     int pending_ready;          /**< Bitmask: which streams have pending data */
     /* RTP output state (when output URL is rtp://) */
     AVFormatContext *rtp_ctx;   /**< Chained RTP muxer context, or NULL for file output */
     int64_t rtp_ts;             /**< Running RTP timestamp */
+    /* IPMX child-context state (when -am824_ipmx 1).
+     *
+     * Architecture: the AM824 muxer's combined output (one multi-channel
+     * AM824 codec stream produced by flush_interleaved) is fed into a child
+     * `ff_ipmx_muxer` AVFormatContext, which applies its existing pacer +
+     * RTCP SR machinery without modifying the RTP packets themselves. The
+     * IPMX muxer treats this child stream like any other AM824 codec
+     * source — same path it already takes for `-c:a am824 -f ipmx`.
+     * Mirrors the mpegtsenc.c pattern of allocating a child format context.
+     */
+    int   ipmx_enable;
+    int   ipmx_audio_base_port;
+    int   ipmx_audio_ptime_us;
+    char *ipmx_sdp_file;
+    char *ipmx_pcap_file;
+    char *ipmx_refclk;
+    char *ipmx_mediaclk;
+    AVFormatContext *ipmx_ctx;  /**< Child IPMX muxer context, NULL when -am824_ipmx is off. */
 } AM824MuxContext;
 
 static int am824_write_header(AVFormatContext *s)
@@ -670,8 +778,222 @@ static int am824_write_header(AVFormatContext *s)
     if (ctx->sample_rate == 0)
         ctx->sample_rate = 48000;
 
+    /* Build per-signal AES3 channel-status block. Each signal pair carries
+     * its own 192-bit channel-status pattern, sequenced per AES3 frame.
+     * Pattern depends on the signal's PCM/non-PCM mode (per S337 §6.2). */
+    {
+        int any_non_pcm = 0;
+        for (i = 0; i < ctx->nsignals; i++)
+            if (ctx->is_nonpcm[i]) { any_non_pcm = 1; break; }
+        for (i = 0; i < ctx->nsignals; i++) {
+            ctx->framing_index[i] = 0;
+            mux_build_signal_chstatus(ctx->channel_status[i], ctx->sample_rate,
+                                      ctx->is_nonpcm[i]);
+            /* S337-6.2: when ANY pair on the wire carries non-PCM, the
+             * physical AES3 word length is 16-bit. PCM-pair channel-status
+             * byte 2 word-length must match the wire word length to satisfy
+             * AES3 §7.2.2 — patch byte 2 + recompute CRC. */
+            if (any_non_pcm && !ctx->is_nonpcm[i]) {
+                ctx->channel_status[i][2]  = CS_BYTE2_WORDLEN_16;
+                ctx->channel_status[i][23] = mux_aes3_chstatus_crc(
+                        ctx->channel_status[i], 23);
+            }
+        }
+    }
+
+    /* For AAC input streams that have extradata (i.e. came from `-c:a aac`
+     * encoder), allocate a child `adts` muxer. Raw AAC packets get routed
+     * through it in write_packet so the AAC payload reaches s337m_wrap_compressed
+     * with the IEC 61937-6-mandated ADTS header. Same pattern as mpegtsenc.c. */
+    ctx->adts_tmp_pkt = av_packet_alloc();
+    if (!ctx->adts_tmp_pkt)
+        return AVERROR(ENOMEM);
+    for (i = 0; i < ctx->nsignals; i++) {
+        AVStream *st = s->streams[i];
+        if (st->codecpar->codec_id == AV_CODEC_ID_AAC &&
+            st->codecpar->extradata_size > 0) {
+            AVFormatContext *amux;
+            AVStream *ast;
+            int ret2;
+            amux = avformat_alloc_context();
+            if (!amux)
+                return AVERROR(ENOMEM);
+            amux->oformat = av_guess_format("adts", NULL, NULL);
+            if (!amux->oformat) {
+                avformat_free_context(amux);
+                return AVERROR(EINVAL);
+            }
+            ast = avformat_new_stream(amux, NULL);
+            if (!ast) {
+                avformat_free_context(amux);
+                return AVERROR(ENOMEM);
+            }
+            ret2 = avcodec_parameters_copy(ast->codecpar, st->codecpar);
+            if (ret2 < 0) {
+                avformat_free_context(amux);
+                return ret2;
+            }
+            ast->time_base = st->time_base.num
+                             ? st->time_base
+                             : (AVRational){1, st->codecpar->sample_rate
+                                              ? st->codecpar->sample_rate : 48000};
+            ret2 = avformat_write_header(amux, NULL);
+            if (ret2 < 0) {
+                avformat_free_context(amux);
+                return ret2;
+            }
+            ctx->adts_amux[i] = amux;
+        }
+    }
+
     ctx->rtp_ctx = NULL;
     ctx->rtp_ts = 0;
+    ctx->ipmx_ctx = NULL;
+
+    /* If -am824_ipmx is set, chain through a child `ff_ipmx_muxer` instead
+     * of a basic RTP muxer. The combined AM824 output produced by
+     * flush_interleaved is fed to the child IPMX context as a single
+     * multi-channel AM824 codec stream. The IPMX child does its existing
+     * job (paced sender, RTCP SRs with IPMX Info Block + AES3 audio MIB,
+     * IPMX-conformant SDP, optional PCAP capture) without modifying the
+     * RTP packets — the wire bytes are byte-identical to the rtp:// path.
+     * Same `mpegtsenc.c`-style child-AVFormatContext pattern. */
+    if (ctx->ipmx_enable) {
+        const AVOutputFormat *ipmx_fmt = av_guess_format("ipmx", NULL, NULL);
+        AVFormatContext *ipmxctx = NULL;
+        AVStream *ipmx_st;
+        int nchan = ctx->nsignals * 2;
+        int ret2;
+
+        if (!ipmx_fmt) {
+            av_log(s, AV_LOG_ERROR,
+                   "AM824: -am824_ipmx 1 requested but ipmx muxer is not built\n");
+            return AVERROR(EINVAL);
+        }
+
+        ret2 = avformat_alloc_output_context2(&ipmxctx, (AVOutputFormat *)ipmx_fmt,
+                                              NULL, s->url);
+        if (ret2 < 0) {
+            av_log(s, AV_LOG_ERROR, "AM824: cannot alloc IPMX child context: %d\n", ret2);
+            return ret2;
+        }
+
+        ipmx_st = avformat_new_stream(ipmxctx, NULL);
+        if (!ipmx_st) {
+            avformat_free_context(ipmxctx);
+            return AVERROR(ENOMEM);
+        }
+        ipmx_st->codecpar->codec_type        = AVMEDIA_TYPE_AUDIO;
+        ipmx_st->codecpar->codec_id          = AV_CODEC_ID_AM824;
+        ipmx_st->codecpar->sample_rate       = ctx->sample_rate;
+        av_channel_layout_default(&ipmx_st->codecpar->ch_layout, nchan);
+        ipmx_st->codecpar->bits_per_coded_sample = 32;
+        ipmx_st->codecpar->bits_per_raw_sample   = 24;
+        ipmx_st->time_base = (AVRational){1, ctx->sample_rate};
+
+        /* Publish AM824 wire-content metadata on the IPMX-child stream's
+         * codecpar->coded_side_data. The IPMX muxer reads this in
+         * write_header to emit the right SDP fmtp channel-order and
+         * AES3 audio MIB sample_size — exactly the same code path used
+         * for the encoder-direct (`-c:a am824 -f ipmx`) case. */
+        {
+            AVPacketSideData *sd = av_packet_side_data_new(
+                    &ipmx_st->codecpar->coded_side_data,
+                    &ipmx_st->codecpar->nb_coded_side_data,
+                    AV_PKT_DATA_AM824_STREAM_INFO,
+                    sizeof(AVAM824StreamInfo), 0);
+            if (sd) {
+                AVAM824StreamInfo info = { 0 };
+                int any_non_pcm = 0;
+                int mask = 0;
+                size_t off;
+                for (i = 0; i < ctx->nsignals; i++) {
+                    if (ctx->is_nonpcm[i]) {
+                        mask |= (1 << i);
+                        any_non_pcm = 1;
+                    }
+                }
+                info.is_non_pcm         = any_non_pcm ? 1 : 0;
+                info.non_pcm_pairs_mask = (uint8_t)(mask & 0xFF);
+                info.sample_size_bits   = any_non_pcm ? 16 : 24;
+                /* Greedy longest-match channel-order builder per
+                 * SMPTE ST 2110-30 §6.2.2 (ST/51/71 group symbols) +
+                 * ST 2110-31 §6.2 AES3 group symbol. Same algorithm as
+                 * am824enc.c — see comments there for why. Walks pairs
+                 * left-to-right; collapses 4 consecutive PCM pairs into
+                 * "71", 3 into "51", otherwise per-pair "ST"/"AES3".
+                 * Allows mixed configurations like (51,AES3), (AES3,71),
+                 * (ST,51,AES3), etc. — purely from the muxer's
+                 * is_nonpcm[] array (encoded into `mask` above). */
+                {
+                    int p = 0;
+                    int first = 1;
+                    off = 0;
+                    off += snprintf(info.channel_order + off,
+                                    sizeof(info.channel_order) - off,
+                                    "SMPTE2110.(");
+                    while (p < ctx->nsignals &&
+                           off + 1 < sizeof(info.channel_order)) {
+                        const char *tok;
+                        int adv;
+                        if (p + 4 <= ctx->nsignals &&
+                            ((mask >> p) & 0xF) == 0) {
+                            tok = "71"; adv = 4;
+                        } else if (p + 3 <= ctx->nsignals &&
+                                   ((mask >> p) & 0x7) == 0) {
+                            tok = "51"; adv = 3;
+                        } else {
+                            tok = (mask & (1u << p)) ? "AES3" : "ST";
+                            adv = 1;
+                        }
+                        off += snprintf(info.channel_order + off,
+                                        sizeof(info.channel_order) - off,
+                                        "%s%s", first ? "" : ",", tok);
+                        first = 0;
+                        p += adv;
+                    }
+                    if (off + 1 < sizeof(info.channel_order))
+                        snprintf(info.channel_order + off,
+                                 sizeof(info.channel_order) - off, ")");
+                }
+                memcpy(sd->data, &info, sizeof(info));
+            }
+        }
+
+        /* Forward IPMX-specific options to the child. */
+        if (ctx->ipmx_audio_base_port > 0)
+            av_opt_set_int(ipmxctx->priv_data, "ipmx_audio_base_port",
+                           ctx->ipmx_audio_base_port, 0);
+        if (ctx->ipmx_audio_ptime_us > 0)
+            av_opt_set_int(ipmxctx->priv_data, "ipmx_audio_ptime_us",
+                           ctx->ipmx_audio_ptime_us, 0);
+        if (ctx->ipmx_sdp_file)
+            av_opt_set(ipmxctx->priv_data, "ipmx_sdp_file",
+                       ctx->ipmx_sdp_file, 0);
+        if (ctx->ipmx_pcap_file)
+            av_opt_set(ipmxctx->priv_data, "ipmx_pcap_file",
+                       ctx->ipmx_pcap_file, 0);
+        if (ctx->ipmx_refclk)
+            av_opt_set(ipmxctx->priv_data, "ipmx_refclk",
+                       ctx->ipmx_refclk, 0);
+        if (ctx->ipmx_mediaclk)
+            av_opt_set(ipmxctx->priv_data, "ipmx_mediaclk",
+                       ctx->ipmx_mediaclk, 0);
+
+        ret2 = avformat_write_header(ipmxctx, NULL);
+        if (ret2 < 0) {
+            av_log(s, AV_LOG_ERROR,
+                   "AM824: child IPMX write_header failed: %d\n", ret2);
+            avformat_free_context(ipmxctx);
+            return ret2;
+        }
+
+        ctx->ipmx_ctx = ipmxctx;
+        av_log(s, AV_LOG_INFO,
+               "AM824: combined %d-channel output → IPMX child (%s)\n",
+               nchan, s->url ? s->url : "(no URL)");
+        return 0;
+    }
 
     /* If output URL is rtp://, chain through the RTP muxer.
      * Create a virtual AM824 output stream for the RTP chain. */
@@ -773,31 +1095,71 @@ static int flush_interleaved(AVFormatContext *s)
     if (!out)
         return AVERROR(ENOMEM);
 
-    /* Interleave: for each sample period, write all signals' L/R */
+    /* Interleave: for each sample period, write all signals' L/R subframes
+     * with full AES3 framing (B/F/PCUV + parity). Each signal advances its
+     * own 192-frame block index so its channel-status sequence is independent.
+     *
+     * Bit layout per AM824 32-bit word (BE):
+     *   bits 31-30: 00 (reserved)
+     *   bit 29:     B (block start — set on first frame of every 192-frame block,
+     *                  on the left subframe of signal 0 only, per AES3)
+     *   bit 28:     F (frame start — set on the left subframe of every signal pair)
+     *   bits 27-24: P, C, U, V
+     *   bits 23-0:  DATA24 */
     for (p = 0; p < min_samples; p++) {
         for (sig = 0; sig < nsig; sig++) {
             const uint8_t *src = ctx->pending[sig]->data + p * 2 * 4;
             int out_base = (p * nchan + sig * 2) * AM824_SUBFRAME_SIZE;
+            int frame_idx = ctx->framing_index[sig];
+            int v_bit = ctx->is_nonpcm[sig] ? 1 : 0;
+            int c_bit = (ctx->channel_status[sig][frame_idx >> 3]
+                         >> (frame_idx & 7)) & 1;
+            int u_bit = 0;
+            int block_start = (frame_idx == 0) && (sig == 0);
 
             for (ch = 0; ch < 2; ch++) {
                 int32_t sample = (int32_t)AV_RB32(src + ch * 4);
                 uint32_t data24 = ((uint32_t)(sample >> 8)) & AM824_DATA24_MASK;
-                uint32_t word = data24;
+                int cuv = (c_bit << 2) | (u_bit << 1) | v_bit;
+                int p_bit = mux_compute_parity(data24, cuv);
+                int pcuv = (p_bit << 3) | cuv;
+                uint32_t word = data24
+                              | ((uint32_t)pcuv << AM824_PCUV_SHIFT);
 
-                /* V bit for non-PCM signals */
-                if (ctx->is_nonpcm[sig])
-                    word |= ((uint32_t)AM824_V_BIT << AM824_PCUV_SHIFT);
-
-                /* F (frame start) for left channel */
+                if (block_start && ch == 0)
+                    word |= (1U << 29);
                 if (ch == 0)
                     word |= (1U << 28);
 
                 AV_WB32(out + out_base + ch * AM824_SUBFRAME_SIZE, word);
             }
+
+            ctx->framing_index[sig] = (frame_idx + 1) % AES3_BLOCK_FRAMES;
         }
     }
 
-    if (ctx->rtp_ctx) {
+    if (ctx->ipmx_ctx) {
+        /* Feed combined AM824 output to the child IPMX muxer. The IPMX
+         * child treats this exactly like a `-c:a am824` codec stream
+         * coming from any other producer — its existing per-stream
+         * `ff_rtp_muxer` (interception via paced_avio) packetises and
+         * the pacer thread schedules wire writes; RTCP SRs are added
+         * around the wire bytes without modifying them. */
+        AVPacket *ipmx_pkt = av_packet_alloc();
+        if (!ipmx_pkt) {
+            av_free(out);
+            return AVERROR(ENOMEM);
+        }
+        ipmx_pkt->data = out;
+        ipmx_pkt->size = out_size;
+        ipmx_pkt->stream_index = 0;
+        ipmx_pkt->pts = ctx->rtp_ts;
+        ipmx_pkt->dts = ctx->rtp_ts;
+        ctx->rtp_ts += min_samples;
+
+        av_write_frame(ctx->ipmx_ctx, ipmx_pkt);
+        av_packet_free(&ipmx_pkt);
+    } else if (ctx->rtp_ctx) {
         /* Send interleaved AM824 data through the chained RTP muxer.
          * The RTP muxer dispatches to ff_rtp_send_am824() which handles
          * ptime-aligned packetization and RTP header generation. */
@@ -935,18 +1297,61 @@ static int am824_write_packet(AVFormatContext *s, AVPacket *pkt)
         if (cid == AV_CODEC_ID_AAC || cid == AV_CODEC_ID_AC3 ||
             cid == AV_CODEC_ID_EAC3 || cid == AV_CODEC_ID_DTS) {
             AVPacket *framed;
+            uint8_t *adts_data = NULL;
+            int adts_size = 0;
+            AVPacket adts_pkt = { 0 };
+            int via_adts = 0;
+
             /* AAC over S337M requires ADTS framing (IEC 61937-6, data type 0x07).
-             * Reject raw AAC (from MP4/MKV) that lacks ADTS headers. */
+             * If the encoder upstream emits raw AAC (no ADTS), route through the
+             * per-stream child `adts` muxer to prepend the ADTS header. Same
+             * pattern as mpegtsenc.c's amux machinery. */
             if (cid == AV_CODEC_ID_AAC && pkt->size >= 2 &&
                 (AV_RB16(pkt->data) & 0xFFF0) != 0xFFF0) {
-                av_log(s, AV_LOG_ERROR,
-                       "AM824: AAC stream %d is not ADTS-framed (got 0x%04x, need 0xFFF_).\n"
-                       "  Use ADTS input (-f adts) or re-encode (-c:a aac) instead of -c:a copy from MP4.\n",
-                       idx, AV_RB16(pkt->data));
-                return AVERROR(EINVAL);
+                AVFormatContext *amux = ctx->adts_amux[idx];
+                int ret2;
+                if (!amux) {
+                    av_log(s, AV_LOG_ERROR,
+                           "AM824: AAC stream %d is not ADTS-framed and no "
+                           "extradata is available to synthesise ADTS headers.\n",
+                           idx);
+                    return AVERROR(EINVAL);
+                }
+                av_packet_unref(ctx->adts_tmp_pkt);
+                ctx->adts_tmp_pkt->data = pkt->data;
+                ctx->adts_tmp_pkt->size = pkt->size;
+                ctx->adts_tmp_pkt->stream_index = 0;
+                if (pkt->dts != AV_NOPTS_VALUE)
+                    ctx->adts_tmp_pkt->dts = av_rescale_q(pkt->dts,
+                        st->time_base.num ? st->time_base
+                                          : (AVRational){1, ctx->sample_rate},
+                        amux->streams[0]->time_base);
+                ret2 = avio_open_dyn_buf(&amux->pb);
+                if (ret2 < 0)
+                    return ret2;
+                ret2 = av_write_frame(amux, ctx->adts_tmp_pkt);
+                if (ret2 < 0) {
+                    ffio_free_dyn_buf(&amux->pb);
+                    return ret2;
+                }
+                av_write_frame(amux, NULL); /* flush */
+                adts_size = avio_close_dyn_buf(amux->pb, &adts_data);
+                amux->pb = NULL;
+                if (adts_size <= 0 || !adts_data) {
+                    av_freep(&adts_data);
+                    av_log(s, AV_LOG_ERROR,
+                           "AM824: child ADTS muxer produced no output for stream %d\n",
+                           idx);
+                    return AVERROR(EINVAL);
+                }
+                adts_pkt.data = adts_data;
+                adts_pkt.size = adts_size;
+                via_adts = 1;
             }
             framed = s337m_wrap_compressed(
-                s, pkt, cid, ctx->sample_rate ? ctx->sample_rate : 48000);
+                s, via_adts ? &adts_pkt : pkt,
+                cid, ctx->sample_rate ? ctx->sample_rate : 48000);
+            av_freep(&adts_data);
             if (!framed)
                 return AVERROR(ENOMEM);
 
@@ -1040,10 +1445,26 @@ static int am824_write_trailer(AVFormatContext *s)
         ctx->rtp_ctx = NULL;
     }
 
+    /* Close the child IPMX muxer if active */
+    if (ctx->ipmx_ctx) {
+        av_write_trailer(ctx->ipmx_ctx);
+        avformat_free_context(ctx->ipmx_ctx);
+        ctx->ipmx_ctx = NULL;
+    }
+
     for (i = 0; i < ctx->nsignals; i++)
         av_packet_free(&ctx->pending[i]);
     av_freep(&ctx->pending);
     av_freep(&ctx->is_nonpcm);
+    /* Tear down per-stream child ADTS muxers (allocated for raw-AAC streams). */
+    for (i = 0; i < AM824_MAX_SIGNALS; i++) {
+        if (ctx->adts_amux[i]) {
+            av_write_trailer(ctx->adts_amux[i]);
+            avformat_free_context(ctx->adts_amux[i]);
+            ctx->adts_amux[i] = NULL;
+        }
+    }
+    av_packet_free(&ctx->adts_tmp_pkt);
     return 0;
 }
 
@@ -1053,6 +1474,28 @@ static int am824_write_trailer(AVFormatContext *s)
 static const AVOption am824_mux_options[] = {
     { "sample_rate", "Sampling frequency (Hz)",
       MOFFSET(sample_rate), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 96000, ENC },
+    /* When set, the AM824 muxer's combined output is fed into a child
+     * `ff_ipmx_muxer` instead of a chained `ff_rtp_muxer`. The IPMX child
+     * adds AES67 §7.5 pacing, RTCP Sender Reports with the IPMX Info Block
+     * and AES3 audio MIB, and IPMX-conformant SDP. The wire bytes (RTP
+     * packets) are byte-identical to the rtp:// path; IPMX intercepts them
+     * via its paced_avio without modifying the bytes. */
+    { "am824_ipmx", "Route the combined AM824 output through the IPMX muxer (paced + RTCP SR)",
+      MOFFSET(ipmx_enable), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    /* Pass-through options forwarded to the child IPMX context. Names match
+     * the IPMX muxer's own AVOptions so users can use the same flags. */
+    { "ipmx_audio_base_port", "(IPMX child) base RTP port for audio streams",
+      MOFFSET(ipmx_audio_base_port), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 65535, ENC },
+    { "ipmx_audio_ptime_us", "(IPMX child) audio nominal packet time in µs",
+      MOFFSET(ipmx_audio_ptime_us), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1000000, ENC },
+    { "ipmx_sdp_file", "(IPMX child) write the per-stream SDP files",
+      MOFFSET(ipmx_sdp_file), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
+    { "ipmx_pcap_file", "(IPMX child) capture the wire to a PCAP file",
+      MOFFSET(ipmx_pcap_file), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
+    { "ipmx_refclk", "(IPMX child) ts-refclk attribute body",
+      MOFFSET(ipmx_refclk), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
+    { "ipmx_mediaclk", "(IPMX child) mediaclk attribute body",
+      MOFFSET(ipmx_mediaclk), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
     { NULL }
 };
 

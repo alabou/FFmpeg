@@ -179,6 +179,18 @@ struct RTPDemuxContext {
     int64_t rtcp_ts_offset;
     AVRTCPSenderReport last_sr; ///< Last RTCP SR data
     int pending_sr; ///< Indicates if there is a SR pending to be attached as sidedata
+    /**
+     * Per-SR IPMX flag (TR-10-1 §8.7).
+     *
+     * Set to 1 by rtcp_parse_packet when the most recently parsed SR
+     * payload carries the IPMX Info Block (16-bit tag 0x5831 immediately
+     * after the 28-byte standard sender info). When set, the SR's NTP
+     * field is decoded as MSW=unix sec, LSW=nanoseconds — independent of
+     * the session-level AVFormatContext::ipmx flag. Cleared on every
+     * non-IPMX SR so the decoding always tracks the current SR's actual
+     * format.
+     */
+    int last_sr_is_ipmx;
 
     /* rtcp sender statistics */
     unsigned int packet_count;

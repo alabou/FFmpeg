@@ -41,11 +41,12 @@
 
 #define MIN_FEEDBACK_INTERVAL 200000 /* 200 ms in us */
 
-static const RTPDynamicProtocolHandler l24_dynamic_handler = {
-    .enc_name   = "L24",
-    .codec_type = AVMEDIA_TYPE_AUDIO,
-    .codec_id   = AV_CODEC_ID_PCM_S24BE,
-};
+/* L24 / L16 are now handled by the IPMX-aware ff_ipmx_l24_dynamic_handler /
+ * ff_ipmx_l16_dynamic_handler in rtpdec_ipmx_pcm.c. The IPMX-aware path
+ * activates only when the SDP carries `channel-order=…` AND
+ * AVFormatContext::ipmx == 1; outside those conditions it returns
+ * AVERROR(ENOSYS) from parse_packet so the caller falls back to the
+ * standard raw-payload path — preserving legacy RFC 3551 behaviour. */
 
 static const RTPDynamicProtocolHandler gsm_dynamic_handler = {
     .enc_name   = "GSM",
@@ -123,7 +124,8 @@ static const RTPDynamicProtocolHandler *const rtp_dynamic_protocol_handler_list[
     &ff_vp8_dynamic_handler,
     &ff_vp9_dynamic_handler,
     &gsm_dynamic_handler,
-    &l24_dynamic_handler,
+    &ff_ipmx_l16_dynamic_handler,
+    &ff_ipmx_l24_dynamic_handler,
     &ff_opus_dynamic_handler,
     &realmedia_mp3_dynamic_handler,
     &speex_dynamic_handler,
@@ -202,6 +204,44 @@ static int rtcp_parse_packet(RTPDemuxContext *s, const unsigned char *buf,
             s->last_sr.rtp_timestamp = AV_RB32(buf + 16);
             s->last_sr.sender_nb_packets = AV_RB32(buf + 20);
             s->last_sr.sender_nb_bytes = AV_RB32(buf + 24);
+
+            /* IPMX per-SR detection (TR-10-1 §8.7). The IPMX Info Block
+             * sits immediately after the 28-byte standard sender info; its
+             * 16-bit tag is 0x5831 ("X1"). When present, this SR's NTP
+             * field is encoded as MSW=unix seconds, LSW=nanoseconds
+             * instead of RFC 3550's MSW=NTP seconds, LSW=fraction × 2^32.
+             * This is local to this SR — it never flips the session-level
+             * AVFormatContext::ipmx flag. */
+            s->last_sr_is_ipmx = (payload_len >= 32 &&
+                                  AV_RB16(buf + 28) == 0x5831);
+
+            /* Resolution rule for "is this SR IPMX-encoded?":
+             *   ic->ipmx ==  1  → yes (CLI / SDP forced on)
+             *   ic->ipmx ==  0  → no  (CLI explicit off — Info Block ignored)
+             *   ic->ipmx == -1  → use per-SR Info Block detection
+             * When the answer is yes, we normalise the SR's ntp_timestamp
+             * from IPMX (MSW=unix sec, LSW=ns) to RFC 3550 (MSW=NTP sec,
+             * LSW=fraction × 2^32) right here, so the rest of the demuxer
+             * (rtp_set_prft, finalize_packet's pts derivation) and any
+             * AV_PKT_DATA_RTCP_SR side-data consumers can stay
+             * RFC 3550-only. */
+            {
+                int sr_is_ipmx = (s->ic && s->ic->ipmx == 1) ||
+                                 (s->ic && s->ic->ipmx == -1 &&
+                                  s->last_sr_is_ipmx);
+                if (sr_is_ipmx) {
+                    uint32_t unix_sec = (uint32_t)(s->last_sr.ntp_timestamp >> 32);
+                    uint32_t ns       = (uint32_t)(s->last_sr.ntp_timestamp);
+                    uint32_t ntp_sec  = unix_sec + (uint32_t)NTP_OFFSET;
+                    /* fraction × 2^32 == ns × 2^32 / 1e9. Compute in 64-bit
+                     * to keep the full precision; the 32-bit truncation at
+                     * the end is the same as RFC 3550 emit-side rounding. */
+                    uint32_t ntp_frac = (uint32_t)(((uint64_t)ns << 32) /
+                                                   1000000000ULL);
+                    s->last_sr.ntp_timestamp =
+                        ((uint64_t)ntp_sec << 32) | ntp_frac;
+                }
+            }
 
             s->pending_sr = 1;
             s->last_rtcp_reception_time = av_gettime_relative();

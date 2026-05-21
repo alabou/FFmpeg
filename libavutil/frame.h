@@ -260,6 +260,24 @@ enum AVFrameSideDataType {
      * EXIF metadata, starting with either 49 49 2a 00, or 4d 4d 00 2a.
      */
      AV_FRAME_DATA_EXIF,
+
+    /**
+     * Indicates that the audio frame's samples carry IEC 61937 / S337m
+     * burst-formatted non-PCM data (i.e. compressed audio wrapped per
+     * IEC 61937-{1,3,6,...}) rather than linear PCM.
+     *
+     * Producers (e.g. the `am824_s337m_wrap` decoder, which converts
+     * AAC/AC3/EAC3 packets into S32 stereo IEC 61937 burst frames) attach
+     * this side data to each output frame. Downstream consumers (e.g.
+     * the `am824` encoder) check for it and, if present, switch into
+     * non-PCM mode for that frame: V=1 in AES3 subframes, NOT_PCM bit
+     * in the channel-status block, 16-bit word-length per S337M §6.2.
+     *
+     * Payload: 1-byte uint8_t. 1 = non-PCM, 0 = PCM. (Strictly speaking,
+     * presence of this side data already implies non-PCM; the byte
+     * exists to allow producers to explicitly assert PCM if needed.)
+     */
+    AV_FRAME_DATA_AM824_NON_PCM,
 };
 
 enum AVActiveFormatDescription {

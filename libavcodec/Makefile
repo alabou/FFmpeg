@@ -700,6 +700,7 @@ OBJS-$(CONFIG_S302M_DECODER)           += s302m.o
 OBJS-$(CONFIG_S302M_ENCODER)           += s302menc.o
 OBJS-$(CONFIG_AM824_DECODER)           += am824dec.o
 OBJS-$(CONFIG_AM824_ENCODER)           += am824enc.o
+OBJS-$(CONFIG_AM824_S337M_WRAP_DECODER) += am824_s337m_wrapdec.o am824_s337m.o
 OBJS-$(CONFIG_SANM_DECODER)            += sanm.o
 OBJS-$(CONFIG_SCPR_DECODER)            += scpr.o
 OBJS-$(CONFIG_SCREENPRESSO_DECODER)    += screenpresso.o

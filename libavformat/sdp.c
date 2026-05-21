@@ -782,6 +782,7 @@ static int sdp_write_media_attributes(char *buff, int size, const AVStream *st,
 
         switch (p->format) {
         case AV_PIX_FMT_UYVY422:
+        case AV_PIX_FMT_YUV422P:
             pix_fmt = "YCbCr-4:2:2";
             break;
         case AV_PIX_FMT_YUV422P10:
@@ -791,11 +792,15 @@ static int sdp_write_media_attributes(char *buff, int size, const AVStream *st,
         case AV_PIX_FMT_YUV420P:
             pix_fmt = "YCbCr-4:2:0";
             break;
+        case AV_PIX_FMT_YUV420P10:
+            pix_fmt = "YCbCr-4:2:0";
+            bit_depth = 10;
+            break;
+        case AV_PIX_FMT_YUV444P:
+            pix_fmt = "YCbCr-4:4:4";
+            break;
         case AV_PIX_FMT_RGB24:
             pix_fmt = "RGB";
-            break;
-        case AV_PIX_FMT_BGR24:
-            pix_fmt = "BGR";
             break;
         default:
             av_log(fmt, AV_LOG_ERROR, "Unsupported pixel format.\n");

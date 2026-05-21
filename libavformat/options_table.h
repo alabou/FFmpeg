@@ -116,6 +116,7 @@ static const AVOption avformat_options[] = {
 {"pep_key_version", "PEP initial key version (hex, auto-generated if omitted)", OFFSET(pep_key_version), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, D|E},
 {"pep_rtp_kv", "use RTP_KV dynamic key versioning", OFFSET(pep_rtp_kv), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, D|E},
 {"pep_kv_rotate", "debug: rotate key_version every N frame boundaries (requires pep_rtp_kv)", OFFSET(pep_kv_rotate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, E},
+{"ipmx", "IPMX session mode (TR-10-1 §8.7): -1=auto from SDP, 0=off, 1=force on (decode SR NTP MSW=unix sec, LSW=nanoseconds)", OFFSET(ipmx), AV_OPT_TYPE_INT, {.i64 = -1}, -1, 1, D|E},
 {NULL},
 };
 

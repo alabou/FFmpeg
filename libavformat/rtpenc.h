@@ -74,6 +74,17 @@ struct RTPMuxContext {
     // cannot reset unless the encryption context values also change in order to provide the expected cipher security.
     //
     uint64_t encryption_input_ctr;  // little endian
+
+    // RFC 4175 / ST 2110-20 §6.1.4 — high 16 bits of the 32-bit Extended
+    // Sequence Number. The low 16 bits are the RTP `seq` field. The high
+    // word is incremented inside ff_rtp_send_raw_rfc4175 each time the RTP
+    // seq wraps from 0xFFFF to 0x0000. Starts at 0 at stream open; the
+    // initial RTP seq may be any value (RFC 3550 randomises it), so the
+    // first wrap can come at any time relative to ext_seq=0 — what
+    // matters is that the combined 32-bit (ext_seq<<16 | rtp_seq)
+    // increments monotonically by 1 per packet, which the receiver
+    // verifies.
+    uint16_t rfc4175_ext_seq;
 };
 
 typedef struct RTPMuxContext RTPMuxContext;
@@ -111,6 +122,28 @@ void ff_rtp_send_av1(AVFormatContext *s1, const uint8_t *buf1, int size, int is_
 void ff_rtp_send_jpeg(AVFormatContext *s1, const uint8_t *buff, int size);
 void ff_rtp_send_raw_rfc4175(AVFormatContext *s1, const uint8_t *buf, int size, int interlaced, int field);
 void ff_rtp_send_am824(AVFormatContext *s1, const uint8_t *buf, int size);
+
+/* RFC 4175 / SMPTE ST 2110-20 wire-format parameters per (codec_id, pix_fmt).
+ * Single source of truth for the rfc4175 packetizer, the rtp init validation
+ * gate, the SDP / IPMX MIB sampling-string emitters, and any caller that
+ * needs to know whether a (codec_id, pix_fmt) pair can be transmitted as
+ * RFC 4175 raw video. See rtpenc_rfc4175.c for the table contents and the
+ * per-row architectural rules. */
+typedef struct FFRFC4175Format {
+    enum AVPixelFormat pix_fmt;
+    enum AVCodecID     codec_id;
+    int                pgroup; /* octets per pgroup */
+    int                xinc;   /* horizontal pixels per pgroup */
+    int                yinc;   /* source scan lines per pgroup-row (progressive) */
+    int                pixels; /* total pixels per pgroup (= xinc * yinc) */
+    int                depth;  /* bits per sample (RFC 4175 / ST 2110-20 SDP depth=) */
+    const char        *sampling; /* SDP sampling= string */
+} FFRFC4175Format;
+
+extern const FFRFC4175Format ff_rfc4175_formats[];
+
+const FFRFC4175Format *ff_rfc4175_get_format(enum AVCodecID codec_id,
+                                             enum AVPixelFormat pix_fmt);
 
 const uint8_t *ff_h263_find_resync_marker_reverse(const uint8_t *restrict start,
                                                   const uint8_t *restrict end);

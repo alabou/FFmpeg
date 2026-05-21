@@ -51,8 +51,10 @@ OBJS-$(CONFIG_RTPDEC)                    += rdt.o                       \
                                             rtp_cipher.o                \
                                             rtp_pep.o                   \
                                             rtpdec.o                    \
+                                            ipmx_chgroup.o              \
                                             rtpdec_ac3.o                \
                                             rtpdec_am824.o              \
+                                            rtpdec_ipmx_pcm.o           \
                                             rtpdec_amr.o                \
                                             rtpdec_asf.o                \
                                             rtpdec_av1.o                \
@@ -529,6 +531,7 @@ OBJS-$(CONFIG_RPL_DEMUXER)               += rpl.o
 OBJS-$(CONFIG_RSO_DEMUXER)               += rsodec.o rso.o pcm.o
 OBJS-$(CONFIG_RSO_MUXER)                 += rsoenc.o rso.o rawenc.o
 OBJS-$(CONFIG_RTP_MPEGTS_MUXER)          += rtpenc_mpegts.o
+OBJS-$(CONFIG_IPMX_MUXER)                += ipmxenc.o
 OBJS-$(CONFIG_RTP_MUXER)                 += rtp.o         \
                                             rtp_cipher.o     \
                                             rtp_pep.o        \

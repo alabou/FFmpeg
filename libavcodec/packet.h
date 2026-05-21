@@ -378,6 +378,15 @@ enum AVPacketSideDataType {
     AV_PKT_DATA_IPMX_USB_TIMING,
 
     /**
+     * AM824 (SMPTE ST 2110-31) stream metadata published by the AM824
+     * encoder for downstream muxers / SDP writers. Carries the AES3
+     * channel-status word length, non-PCM flag, per-pair non-PCM
+     * bitmask, and the SDP fmtp channel-order string. The data is
+     * AVAM824StreamInfo (defined in libavcodec/defs.h).
+     */
+    AV_PKT_DATA_AM824_STREAM_INFO,
+
+    /**
      * The number of side data types.
      * This is not part of the public API/ABI in the sense that it may
      * change when new side data types are added.

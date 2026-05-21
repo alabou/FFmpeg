@@ -28,6 +28,7 @@
 
 #include "avcodec.h"
 #include "codec_internal.h"
+#include "get_bits.h"
 #include "libavutil/imgutils.h"
 #include "thread.h"
 
@@ -96,6 +97,122 @@ static int bitpacked_decode_yuv422p10(AVCodecContext *avctx, AVFrame *frame,
     return 0;
 }
 
+/* RFC 4175 §6.2.3 / ST 2110-20 §6.2.4 — YCbCr-4:4:4 8-bit, 3-byte pgroup
+ * Cb-Y-Cr per pixel, unpacked into AV_PIX_FMT_YUV444P. */
+static int bitpacked_decode_yuv444p(AVCodecContext *avctx, AVFrame *frame,
+                                    const AVPacket *avpkt)
+{
+    const int expected = avctx->width * avctx->height * 3;
+    const uint8_t *src;
+    int ret, i, j;
+
+    if (avpkt->size < expected)
+        return AVERROR_INVALIDDATA;
+
+    ret = ff_thread_get_buffer(avctx, frame, 0);
+    if (ret < 0)
+        return ret;
+
+    src = avpkt->data;
+    for (i = 0; i < avctx->height; i++) {
+        uint8_t *y = frame->data[0] + i * frame->linesize[0];
+        uint8_t *u = frame->data[1] + i * frame->linesize[1];
+        uint8_t *v = frame->data[2] + i * frame->linesize[2];
+        for (j = 0; j < avctx->width; j++) {
+            *u++ = *src++;
+            *y++ = *src++;
+            *v++ = *src++;
+        }
+    }
+    return 0;
+}
+
+/* ST 2110-20:2022 §6.2.5 Table 3 + Figure 5 — YCbCr-4:2:0 10-bit, 15-octet
+ * pgroup covering 8 pixels (4 H × 2 V) as two adjacent 8-bit-style 2×2
+ * blocks: Y00 Y01 Y10 Y11 Cb00 Cr00 Y02 Y03 Y12 Y13 Cb01 Cr01 (each 10 bits,
+ * MSB-first bitstream). */
+static int bitpacked_decode_yuv420p10(AVCodecContext *avctx, AVFrame *frame,
+                                      const AVPacket *avpkt)
+{
+    const int expected = (avctx->width / 4) * (avctx->height / 2) * 15;
+    GetBitContext gb;
+    int ret, i, j;
+
+    if ((avctx->width  & 3) || (avctx->height & 1))
+        return AVERROR_PATCHWELCOME;
+    if (avpkt->size < expected)
+        return AVERROR_INVALIDDATA;
+
+    ret = ff_thread_get_buffer(avctx, frame, 0);
+    if (ret < 0)
+        return ret;
+
+    if ((ret = init_get_bits8(&gb, avpkt->data, avpkt->size)) < 0)
+        return ret;
+
+    for (i = 0; i < avctx->height; i += 2) {
+        uint16_t *y0 = (uint16_t*)(frame->data[0] +  i      * frame->linesize[0]);
+        uint16_t *y1 = (uint16_t*)(frame->data[0] + (i + 1) * frame->linesize[0]);
+        uint16_t *u  = (uint16_t*)(frame->data[1] + (i / 2) * frame->linesize[1]);
+        uint16_t *v  = (uint16_t*)(frame->data[2] + (i / 2) * frame->linesize[2]);
+        for (j = 0; j < avctx->width; j += 4) {
+            /* Block 1 */
+            *y0++ = get_bits(&gb, 10);
+            *y0++ = get_bits(&gb, 10);
+            *y1++ = get_bits(&gb, 10);
+            *y1++ = get_bits(&gb, 10);
+            *u++  = get_bits(&gb, 10);
+            *v++  = get_bits(&gb, 10);
+            /* Block 2 */
+            *y0++ = get_bits(&gb, 10);
+            *y0++ = get_bits(&gb, 10);
+            *y1++ = get_bits(&gb, 10);
+            *y1++ = get_bits(&gb, 10);
+            *u++  = get_bits(&gb, 10);
+            *v++  = get_bits(&gb, 10);
+        }
+    }
+    return 0;
+}
+
+/* RFC 4175 §6.2.4 / ST 2110-20 §6.2.5 — YCbCr-4:2:0 8-bit, 6-byte pgroup
+ * covering a 2×2 source block: Y00 Y01 Y10 Y11 Cb00 Cr00. ST 2110-20 §6.2.5
+ * forbids interlaced 4:2:0; the depacketizer's even-height assumption mirrors
+ * that and is already enforced upstream by the encoder validation gate. */
+static int bitpacked_decode_yuv420p(AVCodecContext *avctx, AVFrame *frame,
+                                    const AVPacket *avpkt)
+{
+    const int expected = avctx->width * avctx->height * 3 / 2;
+    const uint8_t *src;
+    int ret, i, j;
+
+    if (avctx->width  % 2 || avctx->height % 2)
+        return AVERROR_PATCHWELCOME;
+    if (avpkt->size < expected)
+        return AVERROR_INVALIDDATA;
+
+    ret = ff_thread_get_buffer(avctx, frame, 0);
+    if (ret < 0)
+        return ret;
+
+    src = avpkt->data;
+    for (i = 0; i < avctx->height; i += 2) {
+        uint8_t *y0 = frame->data[0] +  i      * frame->linesize[0];
+        uint8_t *y1 = frame->data[0] + (i + 1) * frame->linesize[0];
+        uint8_t *u  = frame->data[1] + (i / 2) * frame->linesize[1];
+        uint8_t *v  = frame->data[2] + (i / 2) * frame->linesize[2];
+        for (j = 0; j < avctx->width; j += 2) {
+            *y0++ = *src++;
+            *y0++ = *src++;
+            *y1++ = *src++;
+            *y1++ = *src++;
+            *u++  = *src++;
+            *v++  = *src++;
+        }
+    }
+    return 0;
+}
+
 static av_cold int bitpacked_init_decoder(AVCodecContext *avctx)
 {
     struct BitpackedContext *bc = avctx->priv_data;
@@ -112,6 +229,15 @@ static av_cold int bitpacked_init_decoder(AVCodecContext *avctx)
             bc->decode = bitpacked_decode_yuv422p10;
         else
             return AVERROR_INVALIDDATA;
+    } else if (avctx->codec_tag == MKTAG('I', '4', '4', '4') &&
+               avctx->pix_fmt == AV_PIX_FMT_YUV444P) {
+        bc->decode = bitpacked_decode_yuv444p;
+    } else if (avctx->codec_tag == MKTAG('I', '4', '2', '0') &&
+               avctx->pix_fmt == AV_PIX_FMT_YUV420P) {
+        bc->decode = bitpacked_decode_yuv420p;
+    } else if (avctx->codec_tag == MKTAG('I', '4', '2', '0') &&
+               avctx->pix_fmt == AV_PIX_FMT_YUV420P10) {
+        bc->decode = bitpacked_decode_yuv420p10;
     } else {
         return AVERROR_INVALIDDATA;
     }
@@ -146,6 +272,8 @@ const FFCodec ff_bitpacked_decoder = {
     FF_CODEC_DECODE_CB(bitpacked_decode),
     .codec_tags     = (const uint32_t []){
         MKTAG('U', 'Y', 'V', 'Y'),
+        MKTAG('I', '4', '4', '4'),
+        MKTAG('I', '4', '2', '0'),
         FF_CODEC_TAGS_END,
     },
 };

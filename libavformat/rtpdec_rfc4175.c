@@ -42,7 +42,8 @@ struct PayloadContext {
     uint8_t *frame;
     unsigned int frame_size;
     unsigned int pgroup; /* size of the pixel group in bytes */
-    unsigned int xinc;
+    unsigned int xinc;   /* horizontal pixels per pgroup */
+    unsigned int yinc;   /* source scan lines per pgroup-row (progressive) — 2 for 4:2:0, else 1 */
 
     uint32_t timestamp;
 };
@@ -53,15 +54,21 @@ static int rfc4175_parse_format(AVStream *stream, PayloadContext *data)
     int tag;
     const AVPixFmtDescriptor *desc;
 
+    /* Per-sampling defaults; the planar pix_fmts are handed to the bitpacked
+     * decoder which unpacks the wire format into AVFrame planes. The packed
+     * pix_fmts (UYVY422, RGB24) keep the existing rawvideo route since their
+     * in-memory layout already matches the wire layout. */
+    data->yinc = 1;
     if (!strncmp(data->sampling, "YCbCr-4:2:2", 11)) {
-        tag = MKTAG('U', 'Y', 'V', 'Y');
         data->xinc = 2;
 
         if (data->depth == 8) {
+            tag = MKTAG('U', 'Y', 'V', 'Y');
             data->pgroup = 4;
             pixfmt = AV_PIX_FMT_UYVY422;
             stream->codecpar->codec_id = AV_CODEC_ID_RAWVIDEO;
         } else if (data->depth == 10) {
+            tag = MKTAG('U', 'Y', 'V', 'Y');
             data->pgroup = 5;
             pixfmt = AV_PIX_FMT_YUV422P10;
             stream->codecpar->codec_id = AV_CODEC_ID_BITPACKED;
@@ -70,12 +77,33 @@ static int rfc4175_parse_format(AVStream *stream, PayloadContext *data)
         }
     } else if (!strncmp(data->sampling, "YCbCr-4:2:0", 11)) {
         tag = MKTAG('I', '4', '2', '0');
-        data->xinc = 4;
-
         if (data->depth == 8) {
+            /* ST 2110-20 §6.2.5: 4:2:0 8-bit pgroup is 6 octets covering a
+             * 2×2 source block — Y00 Y01 Y10 Y11 Cb00 Cr00. */
+            data->xinc = 2;
+            data->yinc = 2;
             data->pgroup = 6;
             pixfmt = AV_PIX_FMT_YUV420P;
-            stream->codecpar->codec_id = AV_CODEC_ID_RAWVIDEO;
+            stream->codecpar->codec_id = AV_CODEC_ID_BITPACKED;
+        } else if (data->depth == 10) {
+            /* ST 2110-20 §6.2.5 Table 3 + Figure 5: 4:2:0 10-bit pgroup is
+             * 15 octets covering 8 pixels (4 H × 2 V), two adjacent 2×2
+             * blocks concatenated. xinc=4, yinc=2, pgroup=15. */
+            data->xinc = 4;
+            data->yinc = 2;
+            data->pgroup = 15;
+            pixfmt = AV_PIX_FMT_YUV420P10;
+            stream->codecpar->codec_id = AV_CODEC_ID_BITPACKED;
+        } else {
+            return AVERROR_INVALIDDATA;
+        }
+    } else if (!strncmp(data->sampling, "YCbCr-4:4:4", 11)) {
+        tag = MKTAG('I', '4', '4', '4');
+        if (data->depth == 8) {
+            data->xinc = 1;
+            data->pgroup = 3;
+            pixfmt = AV_PIX_FMT_YUV444P;
+            stream->codecpar->codec_id = AV_CODEC_ID_BITPACKED;
         } else {
             return AVERROR_INVALIDDATA;
         }
@@ -89,16 +117,6 @@ static int rfc4175_parse_format(AVStream *stream, PayloadContext *data)
         } else {
             return AVERROR_INVALIDDATA;
         }
-    } else if (!strncmp(data->sampling, "BGR", 3)) {
-        tag = MKTAG('B', 'G', 'R', 24);
-        if (data->depth == 8) {
-            data->xinc = 1;
-            data->pgroup = 3;
-            pixfmt = AV_PIX_FMT_BGR24;
-            stream->codecpar->codec_id = AV_CODEC_ID_RAWVIDEO;
-        } else {
-            return AVERROR_INVALIDDATA;
-        }
     } else {
         return AVERROR_INVALIDDATA;
     }
@@ -107,7 +125,8 @@ static int rfc4175_parse_format(AVStream *stream, PayloadContext *data)
     stream->codecpar->format = pixfmt;
     stream->codecpar->codec_tag = tag;
     stream->codecpar->bits_per_coded_sample = av_get_bits_per_pixel(desc);
-    data->frame_size = data->width * data->height * data->pgroup / data->xinc;
+    data->frame_size = data->width * data->height * data->pgroup /
+                       (data->xinc * data->yinc);
 
     if (data->interlaced)
         stream->codecpar->field_order = AV_FIELD_TT;
@@ -321,8 +340,12 @@ static int rfc4175_handle_packet(AVFormatContext *ctx, PayloadContext *data,
         if (data->interlaced)
             line = 2 * line + field;
 
-        /* prevent ill-formed packets to write after buffer's end */
-        copy_offset = (line * data->width + offset) * data->pgroup / data->xinc;
+        /* prevent ill-formed packets to write after buffer's end. Map source
+         * line index → wire-row index (one wire-row covers `yinc` source
+         * lines: 2 for 4:2:0, 1 otherwise) so the byte stride per row in the
+         * receive buffer matches the encoder's emit stride. */
+        copy_offset = ((line / data->yinc) * data->width + offset) *
+                      data->pgroup / data->xinc;
         if (copy_offset + length > data->frame_size || !data->frame)
             return AVERROR_INVALIDDATA;
 

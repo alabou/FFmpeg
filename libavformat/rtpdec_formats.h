@@ -67,6 +67,8 @@ extern const RTPDynamicProtocolHandler ff_h263_2000_dynamic_handler;
 extern const RTPDynamicProtocolHandler ff_h263_rfc2190_dynamic_handler;
 extern const RTPDynamicProtocolHandler ff_h264_dynamic_handler;
 extern const RTPDynamicProtocolHandler ff_hevc_dynamic_handler;
+extern const RTPDynamicProtocolHandler ff_ipmx_l16_dynamic_handler;
+extern const RTPDynamicProtocolHandler ff_ipmx_l24_dynamic_handler;
 extern const RTPDynamicProtocolHandler ff_ilbc_dynamic_handler;
 extern const RTPDynamicProtocolHandler ff_jpeg_dynamic_handler;
 extern const RTPDynamicProtocolHandler ff_mp4a_latm_dynamic_handler;

@@ -311,6 +311,7 @@ const char *av_packet_side_data_name(enum AVPacketSideDataType type)
     case AV_PKT_DATA_RTCP_SR:                    return "RTCP Sender Report";
     case AV_PKT_DATA_EXIF:                       return "EXIF metadata";
     case AV_PKT_DATA_IPMX_USB_TIMING:            return "IPMX USB Source Timing";
+    case AV_PKT_DATA_AM824_STREAM_INFO:          return "AM824 Stream Info";
     }
     return NULL;
 }

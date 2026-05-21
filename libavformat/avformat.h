@@ -1934,6 +1934,26 @@ typedef struct AVFormatContext {
     int pep_rtp_kv;            /**< 1 = RTP_KV dynamic key versioning, 0 = RTP */
     int pep_kv_rotate;         /**< debug: rotate key_version every N frame boundaries (0=disabled, requires pep_rtp_kv) */
     int privacy_mac_size;      /**< 0 for CTR-only, 8 for CMAC modes (set by rtp_pep_init) */
+
+    /**
+     * IPMX session mode (TR-10-1 §8.7).
+     *
+     * Resolution rule (RTP/SDP demuxer):
+     *   -1 (default) — auto: enabled if the SDP carries IPMX markers
+     *                  (`IPMX` token in fmtp, `s=IPMX …` session name,
+     *                  `a=ts-refclk:`, `a=mediaclk:`) at sdp_parse_line.
+     *    0          — force off: ignore SDP markers; decode every SR per
+     *                  RFC 3550 unless the SR itself carries an IPMX
+     *                  Info Block (tag 0x5831), in which case that SR's
+     *                  NTP field is decoded per IPMX *for that SR only*.
+     *    1          — force on: decode every SR per IPMX (MSW = unix
+     *                  seconds, LSW = nanoseconds).
+     *
+     * The session-level flag gates IPMX-specific behaviour beyond NTP
+     * decoding. Per-SR Info-Block detection is local and does not flip
+     * the session flag.
+     */
+    int ipmx;
 } AVFormatContext;
 
 /**

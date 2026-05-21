@@ -23,13 +23,17 @@
  * @file
  * RTP depacketizer for SMPTE ST 2110-31 AM824.
  *
- * Creates one AVStream per AES3 signal pair. PCM signals (channel-order "ST")
- * output S32BE audio. Non-PCM signals ("AES3") are parsed for S337M/IEC 61937
- * bursts and output compressed codec packets (AAC, AC-3, etc.) that FFmpeg
- * decodes with the standard pipeline.
+ * Creates one AVStream per channel-order group (per token in
+ * SMPTE2110.(token1,token2,…)). Examples:
+ *   channel-order=SMPTE2110.(51)        → 1 stream, 5.1 PCM
+ *   channel-order=SMPTE2110.(ST,AES3)   → 2 streams: stereo PCM + AES3 pair
+ *   channel-order=SMPTE2110.(AES3,AES3) → 2 streams: 2 independent AES3 pairs
  *
- * Follows the MPEG2TS multi-stream RTP pattern: parse_packet deinterleaves
- * the RTP payload across all signal pairs and queues per-signal packets.
+ * PCM groups are output as PCM_S32BE (DATA24 left-justified to 32 bits),
+ * with the canonical multichannel layout from the token (mono / stereo /
+ * 5.1 / 7.1 / 22.2 / …). AES3 groups are parsed for S337M / IEC 61937
+ * bursts and emit compressed packets (AAC, AC-3, EAC-3) once the data-type
+ * field is decoded from the first burst.
  */
 
 #include "libavutil/avstring.h"
@@ -39,14 +43,12 @@
 #include "libavcodec/avcodec.h"
 #include "avformat.h"
 #include "internal.h"
+#include "ipmx_chgroup.h"
+#include "rtpdec.h"
 #include "rtpdec_formats.h"
 
-#define AM824_MAX_SIGNALS    40
 #define AM824_SUBFRAME_SIZE  4
 #define AM824_DATA24_MASK    0x00FFFFFF
-#define AM824_PCUV_SHIFT     24
-#define AM824_PCUV_MASK      0x0F
-#define AM824_V_BIT          0x01
 
 /* S337M 16-bit mode sync words */
 #define S337M_PA  0xF872
@@ -63,7 +65,7 @@ static enum AVCodecID s337m_type_to_codec(int data_type)
     }
 }
 
-/* Per-signal S337M burst accumulator */
+/* Per-AES3-group S337M burst accumulator */
 typedef struct S337MAccum {
     uint16_t *words;
     int capacity;
@@ -72,67 +74,27 @@ typedef struct S337MAccum {
 } S337MAccum;
 
 struct PayloadContext {
-    int nchan;
-    int nsignals;
-    int sample_rate;
-    char *channel_order;
-    int signal_is_nonpcm[AM824_MAX_SIGNALS];
-    int signal_stream_idx[AM824_MAX_SIGNALS]; /**< AVStream index per signal */
+    int             nchan;            /* total wire channels (sum across groups) */
+    int             n_groups;
+    int             sample_rate;
+    char           *channel_order;    /* original SDP body, kept for diagnostics */
+    IpmxChGroup     groups[IPMX_MAX_CHGROUPS];
+    int             streams_initialized;
 
-    /* S337M accumulators for non-PCM signals */
-    S337MAccum s337m[AM824_MAX_SIGNALS];
+    /* S337M accumulators — one per group, only AES3 groups use theirs */
+    S337MAccum      s337m[IPMX_MAX_CHGROUPS];
 
-    /* Packet queue: parse_packet fills, successive buf==NULL calls drain */
-    AVPacket *queue[AM824_MAX_SIGNALS];
-    int queue_count;
-    int queue_rd;
+    /* Per-RTP-packet output queue: parse_packet fills it, successive
+     * buf==NULL calls drain it (one queue slot per emitted AVPacket). */
+    AVPacket       *queue[IPMX_MAX_CHGROUPS * 2];
+    int             queue_count;
+    int             queue_rd;
 
-    int64_t pts;
+    int64_t         pts;
 };
 
 /**
- * Parse channel-order groups from SMPTE2110.(group1,group2,...).
- */
-static void parse_channel_order_groups(PayloadContext *data)
-{
-    const char *p;
-    int sig = 0;
-
-    memset(data->signal_is_nonpcm, 0, sizeof(data->signal_is_nonpcm));
-    data->nsignals = 0;
-
-    if (!data->channel_order)
-        return;
-
-    p = strchr(data->channel_order, '(');
-    if (!p)
-        return;
-    p++;
-
-    while (*p && *p != ')' && sig < AM824_MAX_SIGNALS) {
-        const char *end = p;
-        while (*end && *end != ',' && *end != ')')
-            end++;
-
-        if (end - p == 4 && !av_strncasecmp(p, "AES3", 4)) {
-            data->signal_is_nonpcm[sig] = 1;
-        } else if (end - p == 2 && !av_strncasecmp(p, "51", 2)) {
-            sig += 2;
-        } else if (end - p == 2 && !av_strncasecmp(p, "71", 2)) {
-            sig += 3;
-        }
-
-        sig++;
-        p = end;
-        if (*p == ',')
-            p++;
-    }
-
-    data->nsignals = sig;
-}
-
-/**
- * Try to extract a complete S337M burst from a non-PCM signal's accumulator.
+ * Try to extract a complete S337M burst from an AES3 group's accumulator.
  * On success, allocates and returns an AVPacket with the compressed payload.
  */
 static AVPacket *try_extract_burst(S337MAccum *acc)
@@ -166,7 +128,6 @@ static AVPacket *try_extract_burst(S337MAccum *acc)
                 continue;
             }
 
-            /* Update detected codec */
             acc->codec_id = s337m_type_to_codec(data_type);
 
             /* Build compressed payload packet */
@@ -218,103 +179,97 @@ static av_cold int am824_init(AVFormatContext *s, int st_index,
         return 0;
 
     st = s->streams[st_index];
-    data->nchan = st->codecpar->ch_layout.nb_channels;
+    data->nchan       = st->codecpar->ch_layout.nb_channels;
     data->sample_rate = st->codecpar->sample_rate;
-    data->pts = 0;
+    data->pts         = 0;
     data->queue_count = 0;
-    data->queue_rd = 0;
+    data->queue_rd    = 0;
 
     if (data->nchan < 2 || (data->nchan & 1))
         data->nchan = 2;
 
-    if (!data->nsignals)
-        data->nsignals = data->nchan / 2;
-
-    for (i = 0; i < AM824_MAX_SIGNALS; i++) {
+    for (i = 0; i < IPMX_MAX_CHGROUPS; i++) {
         memset(&data->s337m[i], 0, sizeof(data->s337m[i]));
-        data->queue[i] = NULL;
     }
+    for (i = 0; i < (int)(sizeof(data->queue) / sizeof(data->queue[0])); i++)
+        data->queue[i] = NULL;
 
     return 0;
 }
 
 /**
- * Parse SDP a= lines. On the fmtp line with channel-order, create
- * per-signal AVStreams with the correct codec parameters.
+ * Parse SDP a= lines. On the fmtp line with channel-order, parse the
+ * tokens into per-group descriptors and allocate per-group AVStreams.
  */
 static int am824_parse_sdp_line(AVFormatContext *s, int st_index,
                                 PayloadContext *data, const char *line)
 {
     const char *p;
-    int i;
+    int i, n_groups, total_ch, ret;
 
-    if (av_strstart(line, "fmtp:", &p)) {
-        const char *co;
+    if (!av_strstart(line, "fmtp:", &p))
+        return 0;
 
-        /* Skip payload type number */
-        while (*p && *p != ' ')
-            p++;
-        if (*p)
-            p++;
+    /* Skip payload type number */
+    while (*p && *p != ' ')
+        p++;
+    if (*p)
+        p++;
 
-        co = av_stristr(p, "channel-order=");
+    {
+        const char *co = av_stristr(p, "channel-order=");
         if (co) {
-            const char *end;
+            const char *body_paren, *end;
             co += strlen("channel-order=");
             end = co;
             while (*end && *end != ';' && *end != ' ' && *end != '\r' && *end != '\n')
                 end++;
             av_free(data->channel_order);
             data->channel_order = av_strndup(co, end - co);
-            parse_channel_order_groups(data);
+
+            /* Move past `SMPTE2110.(` to the first token. */
+            body_paren = strchr(data->channel_order, '(');
+            if (body_paren) {
+                body_paren++;
+                n_groups = ff_ipmx_parse_chorder(s, body_paren,
+                                                 data->groups,
+                                                 IPMX_MAX_CHGROUPS,
+                                                 &total_ch);
+                if (n_groups < 0)
+                    return n_groups;
+                data->n_groups = n_groups;
+                if (total_ch > 0)
+                    data->nchan = total_ch;
+            }
         }
+    }
 
-        /* Now create per-signal AVStreams.
-         * Stream 0 already exists (created by SDP parser for the m= line).
-         * We modify it for signal 0, and create new streams for signals 1..N-1.
-         */
-        if (st_index >= 0 && data->nsignals > 0) {
-            AVStream *st0 = s->streams[st_index];
-            int sr = st0->codecpar->sample_rate;
+    /* Allocate per-group AVStreams (idempotent: skip if already done — see
+     * the streams_initialized comment below). */
+    if (st_index >= 0 && data->n_groups > 0 && !data->streams_initialized) {
+        AVStream *st0 = s->streams[st_index];
 
-            for (i = 0; i < data->nsignals; i++) {
-                AVStream *st;
+        ret = ff_ipmx_alloc_group_streams(s, st0,
+                                          data->groups, data->n_groups,
+                                          AV_CODEC_ID_PCM_S32BE,
+                                          /* bits_per_coded_sample = */ 32,
+                                          /* bits_per_raw_sample   = */ 24);
+        if (ret < 0)
+            return ret;
 
-                if (i == 0) {
-                    /* Reuse existing stream for signal 0 */
-                    st = st0;
-                } else {
-                    st = avformat_new_stream(s, NULL);
-                    if (!st)
-                        return AVERROR(ENOMEM);
-                    st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
-                    st->codecpar->sample_rate = sr;
-                    avpriv_set_pts_info(st, 32, 1, sr);
-                }
+        data->streams_initialized = 1;
 
-                data->signal_stream_idx[i] = st->index;
-                st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
-
-                if (data->signal_is_nonpcm[i]) {
-                    /* Non-PCM: codec_id stays NONE until S337M detection.
-                     * Set to NONE explicitly so avformat_find_stream_info probes. */
-                    st->codecpar->codec_id = AV_CODEC_ID_NONE;
-                } else {
-                    /* PCM: output as S32BE (DATA24 left-justified to 32 bits) */
-                    st->codecpar->codec_id = AV_CODEC_ID_PCM_S32BE;
-                    st->codecpar->bits_per_coded_sample = 32;
-                    st->codecpar->bits_per_raw_sample   = 24;
-                }
-            }
-
+        av_log(s, AV_LOG_INFO,
+               "AM824 RTP: %d signal group(s) from %s\n",
+               data->n_groups,
+               data->channel_order ? data->channel_order : "(default)");
+        for (i = 0; i < data->n_groups; i++) {
+            const IpmxChGroup *g = &data->groups[i];
             av_log(s, AV_LOG_INFO,
-                   "AM824 RTP: %d signal pairs from %s\n",
-                   data->nsignals, data->channel_order ? data->channel_order : "(default)");
-            for (i = 0; i < data->nsignals; i++) {
-                av_log(s, AV_LOG_INFO, "  signal %d → stream %d (%s)\n",
-                       i, data->signal_stream_idx[i],
-                       data->signal_is_nonpcm[i] ? "non-PCM/S337M" : "PCM");
-            }
+                   "  group %d → stream %d (%s, %d ch, offset %d)\n",
+                   i, g->stream_idx,
+                   g->kind == IPMX_CHGROUP_AES3 ? "AES3 / S337M" : "PCM",
+                   g->nchannels, g->channel_offset);
         }
     }
 
@@ -322,9 +277,8 @@ static int am824_parse_sdp_line(AVFormatContext *s, int st_index,
 }
 
 /**
- * Handle an AM824 RTP packet. Deinterleaves ALL signal pairs and queues
- * per-signal packets. Returns first packet; subsequent buf==NULL calls
- * drain the queue (return 1 = more, 0 = done, <0 = error/empty).
+ * Handle an AM824 RTP packet. Deinterleaves all groups and queues per-group
+ * packets. Returns first packet; subsequent buf==NULL calls drain the queue.
  */
 static int am824_handle_packet(AVFormatContext *ctx, PayloadContext *data,
                                AVStream *st, AVPacket *pkt,
@@ -332,8 +286,8 @@ static int am824_handle_packet(AVFormatContext *ctx, PayloadContext *data,
                                const uint8_t *buf, int len,
                                uint16_t seq, int flags)
 {
-    int sig, p, ch, ret;
-    int nchan, nsignals, periods;
+    int g_idx, p, ch, ret;
+    int nchan, n_groups, periods;
 
     /* --- Drain queued packets (buf==NULL) --- */
     if (!buf) {
@@ -348,64 +302,122 @@ static int am824_handle_packet(AVFormatContext *ctx, PayloadContext *data,
         return AVERROR(EAGAIN);
     }
 
-    /* --- Process new RTP payload --- */
     if (len < 4 || (len % 4) != 0) {
         av_log(ctx, AV_LOG_WARNING,
                "AM824: invalid payload size %d\n", len);
         return AVERROR_INVALIDDATA;
     }
 
-    nchan = data->nchan;
-    nsignals = data->nsignals;
-    if (nsignals <= 0) {
-        /* Fallback: no channel-order parsed, single signal */
-        nsignals = 1;
-        data->signal_stream_idx[0] = st ? st->index : 0;
+    /* IPMX PEP / HDCP decryption (TR-10-13). The generic rtpdec.c decrypt
+     * path runs only when no dynamic handler is registered; handlers like
+     * us are expected to decrypt their own payloads in place. The whole
+     * AM824 RTP payload is encrypted (no per-payload header), so we
+     * decrypt `buf, len` directly. This mirrors rtpdec_rfc4175 / rtpdec_h264.
+     *
+     * `s` (RTPDemuxContext) is reachable via ctx->parent.d, set by the
+     * caller (rtp_recv_data) before invoking parse_packet. */
+    {
+        RTPDemuxContext *rtps = ctx->parent.d;
+        int cipher_flags = 0;
+        if (flags & RTP_FLAG_EXTHDRFULL)
+            cipher_flags |= AVCIPHERCB_VALIDPARAM | AVCIPHERCB_VALIDINPUTCTR;
+
+        #pragma GCC diagnostic ignored "-Wdiscarded-qualifiers"
+        if (rtps && rtps->privacy_cipher) {
+            if (rtps->privacy_cipher->callback(rtps->privacy_cipher->opaque,
+                    rtps->encryption_stream_ctr, rtps->encryption_input_ctr,
+                    buf, len, cipher_flags) < 0)
+                return AVERROR_INVALIDDATA;
+            len -= rtps->privacy_mac_size;  /* strip CMAC tag if present */
+        }
+        if (rtps && rtps->hdcp_cipher) {
+            if (rtps->hdcp_cipher->callback(rtps->hdcp_cipher->opaque,
+                    rtps->encryption_stream_ctr, rtps->encryption_input_ctr,
+                    buf, len, cipher_flags) < 0)
+                return AVERROR_INVALIDDATA;
+        }
+        if (rtps) {
+            rtps->encryption_current_ctr = rtps->encryption_input_ctr +
+                ((len & 15) ? (len >> 4) + 1 : (len >> 4));
+        }
+    }
+
+    /* Re-validate length after MAC stripping. */
+    if (len < 4 || (len % 4) != 0) {
+        av_log(ctx, AV_LOG_WARNING,
+               "AM824: invalid payload size %d after MAC strip\n", len);
+        return AVERROR_INVALIDDATA;
+    }
+
+    nchan    = data->nchan;
+    n_groups = data->n_groups;
+    if (n_groups <= 0) {
+        /* No channel-order parsed: fall back to one stereo PCM group so
+         * we at least emit something usable. */
+        data->groups[0].kind            = IPMX_CHGROUP_PCM;
+        data->groups[0].nchannels       = 2;
+        data->groups[0].channel_offset  = 0;
+        data->groups[0].layout          = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+        data->groups[0].stream_idx      = st ? st->index : 0;
+        data->n_groups = n_groups = 1;
     }
 
     periods = (len / AM824_SUBFRAME_SIZE) / nchan;
     if (periods <= 0)
         return AVERROR_INVALIDDATA;
 
-    /* Free any leftover queued packets */
+    /* Free any leftover queued packets from the previous RTP packet. */
     {
         int qi;
         for (qi = data->queue_rd; qi < data->queue_count; qi++)
             av_packet_free(&data->queue[qi]);
     }
     data->queue_count = 0;
-    data->queue_rd = 0;
+    data->queue_rd    = 0;
 
-    /* Deinterleave ALL signals from this RTP payload */
-    for (sig = 0; sig < nsignals; sig++) {
-        int st_idx = data->signal_stream_idx[sig];
+    /* --- Deinterleave wire bytes into per-group output ---
+     *
+     * Wire layout per period: nchan AES3 subframes (4 B each), in declared
+     * channel order. A group spans `nchannels` consecutive subframes
+     * starting at `channel_offset`. */
+    for (g_idx = 0; g_idx < n_groups; g_idx++) {
+        IpmxChGroup *g = &data->groups[g_idx];
+        int g_ch       = g->nchannels;
+        int g_off      = g->channel_offset;
+        int st_idx     = g->stream_idx;
 
-        if (!data->signal_is_nonpcm[sig]) {
-            /* PCM signal: extract DATA24 as S32BE stereo */
+        if (g->kind == IPMX_CHGROUP_PCM) {
+            /* Output PCM_S32BE: DATA24 left-justified, repeated for every
+             * channel in the group, every period. */
             AVPacket *pp = av_packet_alloc();
+            int dst_per_period;
             if (!pp) return AVERROR(ENOMEM);
-            ret = av_new_packet(pp, periods * 2 * 4);
+            dst_per_period = g_ch * 4;
+            ret = av_new_packet(pp, periods * dst_per_period);
             if (ret < 0) { av_packet_free(&pp); return ret; }
 
             for (p = 0; p < periods; p++) {
-                int src_off = (p * nchan + sig * 2) * AM824_SUBFRAME_SIZE;
-                int dst_off = p * 2 * 4;
-                for (ch = 0; ch < 2; ch++) {
-                    uint32_t word = AV_RB32(buf + src_off + ch * AM824_SUBFRAME_SIZE);
+                int src_period_off = p * nchan * AM824_SUBFRAME_SIZE;
+                int dst_off        = p * dst_per_period;
+                for (ch = 0; ch < g_ch; ch++) {
+                    int src_off = src_period_off +
+                                  (g_off + ch) * AM824_SUBFRAME_SIZE;
+                    uint32_t word   = AV_RB32(buf + src_off);
                     uint32_t data24 = word & AM824_DATA24_MASK;
-                    int32_t sample = ((int32_t)data24) << 8;
+                    int32_t  sample = ((int32_t)data24) << 8;
                     AV_WB32(pp->data + dst_off + ch * 4, sample);
                 }
             }
 
             pp->stream_index = st_idx;
-            pp->pts = data->pts;
-            pp->dts = data->pts;
+            pp->pts          = data->pts;
+            pp->dts          = data->pts;
             data->queue[data->queue_count++] = pp;
 
         } else {
-            /* Non-PCM signal: accumulate 16-bit SPDIF words */
-            S337MAccum *acc = &data->s337m[sig];
+            /* AES3 group (always 2 channels): accumulate 16-bit S/PDIF
+             * words and try to extract S337M bursts. */
+            S337MAccum *acc = &data->s337m[g_idx];
             int needed = acc->count + periods * 2;
             AVPacket *burst_pkt;
 
@@ -418,32 +430,39 @@ static int am824_handle_packet(AVFormatContext *ctx, PayloadContext *data,
             }
 
             for (p = 0; p < periods; p++) {
-                int src_off = (p * nchan + sig * 2) * AM824_SUBFRAME_SIZE;
+                int src_period_off = p * nchan * AM824_SUBFRAME_SIZE;
                 for (ch = 0; ch < 2; ch++) {
-                    uint32_t word = AV_RB32(buf + src_off + ch * AM824_SUBFRAME_SIZE);
+                    int src_off = src_period_off +
+                                  (g_off + ch) * AM824_SUBFRAME_SIZE;
+                    uint32_t word   = AV_RB32(buf + src_off);
                     uint32_t data24 = word & AM824_DATA24_MASK;
                     acc->words[acc->count++] = (uint16_t)(data24 >> 8);
                 }
             }
 
-            /* Try to extract S337M burst(s) */
             while ((burst_pkt = try_extract_burst(acc)) != NULL) {
-                /* On first burst: update the stream's codec_id */
+                /* On first burst: upgrade the AVStream's codec_id from NONE
+                 * (set at SDP-allocation time) to the burst-derived codec. */
                 if (st_idx >= 0 && st_idx < ctx->nb_streams &&
                     ctx->streams[st_idx]->codecpar->codec_id == AV_CODEC_ID_NONE) {
-                    ctx->streams[st_idx]->codecpar->codec_id = acc->codec_id;
+                    ctx->streams[st_idx]->codecpar->codec_id    = acc->codec_id;
                     ctx->streams[st_idx]->codecpar->sample_rate = data->sample_rate;
-                    ctx->streams[st_idx]->codecpar->ch_layout =
+                    ctx->streams[st_idx]->codecpar->ch_layout   =
                         (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
                     av_log(ctx, AV_LOG_INFO,
-                           "AM824 RTP: signal %d detected %s (S337M)\n",
-                           sig, avcodec_get_name(acc->codec_id));
+                           "AM824 RTP: group %d (stream %d) detected %s (S337M)\n",
+                           g_idx, st_idx, avcodec_get_name(acc->codec_id));
                 }
 
                 burst_pkt->stream_index = st_idx;
-                burst_pkt->pts = data->pts;
-                burst_pkt->dts = data->pts;
-                data->queue[data->queue_count++] = burst_pkt;
+                burst_pkt->pts          = data->pts;
+                burst_pkt->dts          = data->pts;
+                if (data->queue_count <
+                    (int)(sizeof(data->queue) / sizeof(data->queue[0]))) {
+                    data->queue[data->queue_count++] = burst_pkt;
+                } else {
+                    av_packet_free(&burst_pkt);
+                }
             }
         }
     }
@@ -470,10 +489,10 @@ static void am824_close_context(PayloadContext *data)
 {
     int i;
     av_freep(&data->channel_order);
-    for (i = 0; i < AM824_MAX_SIGNALS; i++) {
+    for (i = 0; i < IPMX_MAX_CHGROUPS; i++)
         av_freep(&data->s337m[i].words);
+    for (i = 0; i < (int)(sizeof(data->queue) / sizeof(data->queue[0])); i++)
         av_packet_free(&data->queue[i]);
-    }
 }
 
 const RTPDynamicProtocolHandler ff_am824_dynamic_handler = {
