@@ -32,8 +32,10 @@
 
 #include "config_components.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -47,6 +49,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/log.h"
+#include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
@@ -82,7 +85,28 @@ extern const FFOutputFormat ff_rtp_muxer;
 #define IPMX_MIB_TYPE_VIDEO_H264    0x000A  /* TR-10-15c §16 */
 #define IPMX_MIB_TYPE_PEP           0x0011  /* TR-10-13 */
 
+/* Video MIB rate field: 22-bit frame-rate numerator, 10-bit denominator. */
+#define IPMX_MIB_RATE_NUM_MAX       0x3fffff
+#define IPMX_MIB_RATE_DEN_MAX       0x3ff
+
+/* Relative tolerance for recognising a nominal frame rate (N or N·1000/1001
+ * fps) in a container rate. Container timestamps are rounded: 59.94 fps in
+ * a 90 kHz MP4 track reads back as 54000000/900901 (1 ppm from 60000/1001),
+ * while neighbouring nominal rates (60 vs 59.94) are 1000 ppm apart. */
+#define IPMX_FRAME_RATE_SNAP_TOLERANCE 1e-4
+
+/* RFC 7798 §7.1 tx-mode. The muxer produces a single RTP stream (SRST). The
+ * SDP fmtp line and H.265 MIB 0x0009 both carry this value, so TR-10-15b §16
+ * "present in the fmtp line ⇒ present in the MIB, same syntax" holds by
+ * construction. */
+#define IPMX_HEVC_TX_MODE           "SRST"
+static_assert(sizeof(IPMX_HEVC_TX_MODE) - 1 == 4, "MIB 0x0009 tx-mode is a 4-byte field");
+/* TR-10-15b §16: MIB 0x0009 sprop-vps/sps/pps lengths are 1 byte. */
+#define IPMX_H265_SPROP_MAX_CHARS   255
+
 #define RTCP_PT_SR                  200
+#define RTCP_PT_SDES                202     /* RFC 3550 §12.1 */
+#define SDES_ITEM_CNAME             0x01    /* RFC 3550 §6.5.1 */
 
 /* DSCP per IPMX TP-10-1 §13.1: 36 (AF42) for video, 34 (AF41) for audio.
  * IP_TOS / IP byte 1 expects DSCP shifted left by 2 (low 2 bits = ECN). */
@@ -225,6 +249,24 @@ typedef struct IpmxTraceEntry {
     int      kind;            /* 0=RTP, 1=SR */
     int      late_us;         /* t_us - target_us; positive = late */
 } IpmxTraceEntry;
+
+/* In-memory HRD pacing trace — one record per compressed-video AU, written
+ * by the mux thread at the AU's marker packet (single writer per stream).
+ * Records the inputs and the outcome of the inter-AU pacing decision so the
+ * HRD transmitter schedule can be checked against the wire. Times are
+ * relative to the stream epoch. Disabled when ipmx_hrd_trace_cap = 0. */
+typedef struct IpmxHrdTraceEntry {
+    int      au_idx;
+    int64_t  rtp_payload_bytes;   /* RTP payload bytes, RFC 6184/7798 payload headers included */
+    int64_t  nal_unit_bytes;      /* NAL unit bytes (H.264 eq C-6 b(n) / H.265 eq C-8 sizeInbits, ÷8) */
+    int64_t  pace_us;             /* first-packet target of this AU (after eq C-3 stall and HRD ceiling) */
+    int64_t  t_af_advance_us;     /* drain time used for the inter-AU advance */
+    int64_t  t_r_n_us;            /* t_r,n of this AU (pic_timing SEI) */
+    int64_t  frame_epoch_next_us; /* encoder pour time of the next AU */
+    int64_t  pace_next_us;        /* lower bound max(frame_epoch, t_af) set for the next AU,
+                                   * before its eq C-3 stall and HRD ceiling */
+    int64_t  clamp_us;            /* HRD-ceiling reduction of this AU's pace_us (0 = none) */
+} IpmxHrdTraceEntry;
 
 /* Pacer thread state. No heap, no pool — just the thread + trace ring.
  * All event storage lives in per-stream rings (IpmxStreamRT.ring). */
@@ -374,18 +416,43 @@ typedef struct IpmxStreamRT {
                                      * otherwise (preserves legacy behaviour for non-HRD sources). */
     int64_t  comp_cum_payload_bytes;/* cumulative RTP payload bytes dispatched (whole stream — for diagnostics) */
     int64_t  comp_au_cum_bytes;     /* RTP payload bytes within current AU (resets on marker) */
-    int64_t  comp_au_nal_bytes;     /* NAL bytes within current AU (= comp_au_cum_bytes minus per-packet
-                                     * RTP header overhead). Used at marker to compute t_af(j-1) =
-                                     * comp_au_nal_bytes·8 / max_bitrate for the H.264 §C.1.1 / H.265
-                                     * §C.2.1.1 eq (C-2)/(C-3) inter-AU advance. max_bitrate from HRD
-                                     * is the NAL-byte rate (per spec); using wire bytes here would
-                                     * over-estimate t_af by the RTP header overhead. Resets on marker. */
+    int64_t  comp_au_rtp_payload_bytes; /* RTP payload bytes within current AU (RTP header and extension
+                                     * excluded, RFC 6184/7798 payload-format headers included). HRD
+                                     * trace only. Resets on marker. */
+    int64_t  comp_au_nal_unit_bytes;/* NAL unit bytes of the current AU, counted by ipmx_write_packet
+                                     * from the AVPacket handed to the RTP packetizer. Used at marker
+                                     * for the HRD drain time b(n)/BitRate (H.264 eq C-6, H.265 eq C-8)
+                                     * of the inter-AU advance. BitRate counts the Type II bitstream,
+                                     * so payload-format headers (FU, AP, STAP-A) must not be counted.
+                                     * Resets on marker. */
+    IpmxHrdTraceEntry *hrd_trace;   /* HRD pacing trace ring (ipmx_hrd_trace_cap entries; NULL = off) */
+    unsigned hrd_trace_count;       /* records written (ring index = count % cap) */
 
     /* Parameter sets cached from codecpar->extradata for MIB 0x000A / 0x0009. */
     uint8_t *sps_data;   int sps_len;
     uint8_t *pps_data;   int pps_len;
     uint8_t *vps_data;   int vps_len;   /* H.265 only */
     int      h264_packetization_mode;   /* RFC 6184 §6.2 (1 = non-interleaved) */
+
+    /* HEVC profile_tier_level fields, parsed once from the cached SPS RBSP at
+     * write_header and reused by both the MIB builder (ipmx_build_h265_mib)
+     * and the SDP fmtp augmentation in ipmx_sdp_emit_video_compressed_block.
+     * All values are RFC 7798 fmtp parameter sources per AMWA BCP-006-03:
+     *   general_profile_space  → profile-space=
+     *   general_profile_idc    → profile-id=
+     *   general_tier_flag      → tier-flag=
+     *   general_level_idc      → level-id=
+     *   general_profile_compatibility_flag[32] (bit-reversed) → profile-compatibility-indicator=
+     *   general_constraint_indicator_flags (48 bits)          → interop-constraints=
+     * hevc_ptl_valid is set to 1 when the parse succeeded (SPS present and
+     * ≥ 13 bytes of RBSP). */
+    uint8_t  hevc_profile_space;
+    uint8_t  hevc_profile_idc;
+    uint8_t  hevc_tier_flag;
+    uint8_t  hevc_level_idc;
+    uint32_t hevc_profile_compat;        /* already bit-reversed, ready to format as %08X */
+    uint8_t  hevc_interop_constraints[6];/* big-endian, 48-bit field; format as 12 hex chars */
+    int      hevc_ptl_valid;
 
     /* HRD state — populated at write_header by parsing SPS VUI HRD parameters.
      * Per TR-10-15c §15 / TR-10-15b §15 + H.264 §C.1.1 / H.265 §C.2.1.1.
@@ -397,20 +464,31 @@ typedef struct IpmxStreamRT {
     int      hrd_initial_cpb_removal_delay_length; /* SEI bit width for initial_cpb_removal_delay[] */
     int64_t  hrd_max_bitrate_bps;               /* (bit_rate_value_minus1[0]+1) · 2^(6+bit_rate_scale) */
     int64_t  hrd_cpb_size_bits;                 /* (cpb_size_value_minus1[0]+1) · 2^(4+cpb_size_scale) */
-    int64_t  hrd_clock_tick_us;                 /* (num_units_in_tick · 1e6) / time_scale  — H.264 uses 2·num_units_in_tick / time_scale for frame rate; we store the clock tick directly */
+    uint32_t vui_num_units_in_tick;             /* SPS VUI timing: clock tick t_c = num_units_in_tick / time_scale s; */
+    uint32_t vui_time_scale;                    /* also the frame rate (ipmx_select_video_rate). H.264: 2 ticks per frame */
 
-    /* Per-AU HRD runtime state — updated by ipmx_hrd_process_packet on each
-     * received SEI; consumed by the conformance check at marker and (when the
-     * VBR branch lands) by frame_epoch_us computation. All values in µs
-     * relative to stream_epoch_us. */
+    unsigned hrd_bp_sei_count;                  /* buffering_period SEI parsed (HRD summary) */
+    unsigned hrd_pt_sei_count;                  /* pic_timing SEI parsed (HRD summary) */
+
+    /* Per-AU HRD runtime state — updated by the SEI walker on the clear access
+     * unit (ipmx_write_packet); consumed by the conformance check at marker and (when the
+     * VBR branch lands) by frame_epoch_us computation. Times in µs
+     * relative to stream_epoch_us. The t_r,n schedule itself is kept in
+     * clock ticks from AU 0's removal time (eq C-8 / C-9 only add
+     * cpb_removal_delay ticks), so it accumulates no rounding;
+     * hrd_t_r_n_j_us is the µs value of hrd_t_r_n_j_ticks. */
     int64_t  hrd_init_delay_us;                 /* most recent BP SEI initial_cpb_removal_delay (used by VBR `tai_earliest`) */
     int64_t  hrd_init_offset_us;                /* most recent BP SEI initial_cpb_removal_delay_offset (VBR only) */
     int64_t  hrd_init_delay_first_us;           /* cached AU-0's init_delay; for diagnostic logging at loop detection */
     int64_t  hrd_init_offset_first_us;          /* cached AU-0's init_offset; for diagnostic logging at loop detection */
-    int64_t  hrd_t_r_n_n_b_us;                  /* t_r,n of the first AU of the CURRENT buffering period (C-9 anchor) */
-    int64_t  hrd_t_r_n_n_b_prev_us;             /* t_r,n of the first AU of the PREVIOUS buffering period (C-8 anchor) */
-    int64_t  hrd_t_r_n_j_us;                    /* t_r,n(j) of the CURRENT AU (just-seen pic_timing SEI) */
-    int64_t  hrd_t_r_n_prev_au_us;              /* t_r,n(j-1) — monotonicity reference for loop / splice detection */
+    int64_t  hrd_t_r_n_base_us;                 /* t_r,n(0) = AU 0's initial_cpb_removal_delay (eq C-7) */
+    int64_t  hrd_t_r_n_n_b_ticks;               /* t_r,n of the first AU of the CURRENT buffering period (C-9 anchor) */
+    int64_t  hrd_t_r_n_n_b_prev_ticks;          /* t_r,n of the first AU of the PREVIOUS buffering period (C-8 anchor) */
+    int64_t  hrd_t_r_n_j_ticks;                 /* t_r,n(j) of the CURRENT AU (just-seen pic_timing SEI) */
+    int64_t  hrd_t_r_n_prev_au_ticks;           /* t_r,n(j-1) — monotonicity reference for loop / splice detection */
+    int64_t  hrd_t_r_n_step_ticks;              /* last t_r,n(j) − t_r,n(j-1) > 0: the encoder's per-AU removal
+                                                 * interval (re-anchor step; 0 until two AUs were seen) */
+    int64_t  hrd_t_r_n_j_us;                    /* t_r,n(j) of the CURRENT AU, µs */
     int64_t  hrd_t_af_prev_us;                  /* t_af(j-1) — final-arrival time of previous AU's last byte (β-free) */
     int64_t  hrd_anchor_offset_us;              /* cumulative offset added to every t_r,n; bumped at loop / splice */
     int64_t  hrd_au_offset0_us;                 /* TR-10-15c §15 AU_offset(0): idle shift applied to AU 0's
@@ -449,6 +527,9 @@ typedef struct IpmxStreamRT {
     int      hrd_at_new_bp;                     /* set when current AU is first of a new BP — controls C-7/C-8 vs C-9 */
     int      hrd_saw_bp_in_this_au;             /* per-AU scratch for §15 BP+recovery_point cross-check */
     int      hrd_saw_recovery_point_in_this_au; /* per-AU scratch (same) */
+    int      hrd_saw_pt_in_this_au;             /* per-AU scratch: hrd_t_r_n_j_us is this AU's t_r,n */
+    int64_t  hrd_tai_earliest_wall_us;          /* per-AU scratch: epoch_us + eq C-3 tai_earliest (VBR, AU > 0); 0 = none */
+    int64_t  hrd_clamp_this_au_us;              /* HRD-ceiling reduction of this AU's comp_pace_epoch_us (trace) */
     int      hrd_seen_first_au;                 /* 0 until first BP/pic_timing seen (gates t_r,n computation) */
 
     /* Audio state (ST 2110-30 / TR-10-3 for PCM, ST 2110-31 / TR-10-12 for AM824). */
@@ -595,6 +676,7 @@ typedef struct IpmxMuxContext {
     char            *pcap_file;
     char            *sender_mac;
     char            *src_ip;
+    char            *cname;              /* RTCP SDES CNAME; default ipmx@<src-ip> */
     int              src_port_base;      /* synthesised PCAP src port; +i per stream */
 
     /* Pacer drain heuristic — per-stream lookahead window multipliers. */
@@ -603,6 +685,8 @@ typedef struct IpmxMuxContext {
     int              idle_poll_us;       /* max sleep when all rings empty */
     int              pacer_trace_cap;    /* in-memory trace ring size (0 = disabled) */
     char            *pacer_trace_file;   /* dump path for trace at close (NULL = stderr) */
+    int              hrd_trace_cap;      /* per-stream HRD pacing trace size, in AUs (0 = disabled) */
+    char            *hrd_trace_file;     /* dump path for the HRD trace at close (NULL = stderr) */
 
     /* PCAP file handle. */
     FILE            *pcap_fp;
@@ -850,7 +934,7 @@ static void ipmx_cache_param_sets(IpmxStreamRT *st,
  *
  * Parses the SPS NAL unit's VUI HRD section (H.264 Annex E / H.265 Annex E)
  * and captures the fields needed by the HRD-aware pacer:
- *   - num_units_in_tick / time_scale → hrd_clock_tick_us
+ *   - num_units_in_tick / time_scale → vui_num_units_in_tick / vui_time_scale
  *   - nal_hrd_parameters.bit_rate_value_minus1[0] / bit_rate_scale → hrd_max_bitrate_bps
  *   - nal_hrd_parameters.cpb_size_value_minus1[0] / cpb_size_scale → hrd_cpb_size_bits
  *   - cbr_flag[0] → hrd_cbr_flag (selects CBR eq C-2 vs VBR eq C-3 branch)
@@ -1028,8 +1112,10 @@ static int ipmx_extract_sps_hrd_h264(IpmxStreamRT *st, void *log_ctx)
         unsigned int time_scale = get_bits_long(&gb, 32);
         skip_bits1(&gb);                                    /* fixed_frame_rate_flag */
         /* H.264 convention: time_scale = 2 × frame_rate; t_c = num_units_in_tick / time_scale. */
-        if (time_scale > 0 && num_units > 0)
-            st->hrd_clock_tick_us = (int64_t)num_units * 1000000 / (int64_t)time_scale;
+        if (time_scale > 0 && num_units > 0) {
+            st->vui_num_units_in_tick = num_units;
+            st->vui_time_scale        = time_scale;
+        }
     }
     if (get_bits1(&gb)) {                                   /* nal_hrd_parameters_present_flag */
         ret = ipmx_extract_hrd_parameters_block(&gb, st, log_ctx);
@@ -1260,8 +1346,10 @@ static int ipmx_extract_sps_hrd_h265(IpmxStreamRT *st, void *log_ctx)
         unsigned int num_units = get_bits_long(&gb, 32);
         unsigned int time_scale = get_bits_long(&gb, 32);
         /* H.265 convention: t_c = num_units_in_tick / time_scale directly. */
-        if (time_scale > 0 && num_units > 0)
-            st->hrd_clock_tick_us = (int64_t)num_units * 1000000 / (int64_t)time_scale;
+        if (time_scale > 0 && num_units > 0) {
+            st->vui_num_units_in_tick = num_units;
+            st->vui_time_scale        = time_scale;
+        }
         if (get_bits1(&gb))                                 /* vui_poc_proportional_to_timing_flag */
             get_ue_golomb_long(&gb);                        /* vui_num_ticks_poc_diff_one_minus1 */
         if (get_bits1(&gb)) {                               /* vui_hrd_parameters_present_flag */
@@ -1471,6 +1559,7 @@ static int ipmx_hrd_extract_bp(IpmxStreamRT *st, int is_h265,
     }
     st->hrd_saw_bp_in_this_au = 1;
     st->hrd_at_new_bp = 1;
+    st->hrd_bp_sei_count++;
     if (!st->hrd_seen_first_au) {
         st->hrd_init_delay_first_us = st->hrd_init_delay_us;
         st->hrd_init_offset_first_us = st->hrd_init_offset_us;
@@ -1478,6 +1567,16 @@ static int ipmx_hrd_extract_bp(IpmxStreamRT *st, int is_h265,
 end:
     av_free(rbsp);
     return ret;
+}
+
+/* t_r,n in µs relative to the stream epoch for a schedule position in clock
+ * ticks from AU 0 (t_c = num_units_in_tick / time_scale), rounded once. */
+static int64_t ipmx_hrd_t_r_n_us(const IpmxStreamRT *st, int64_t ticks)
+{
+    if (!st->vui_time_scale)
+        return st->hrd_t_r_n_base_us;
+    return st->hrd_t_r_n_base_us +
+           av_rescale(ticks, (int64_t)st->vui_num_units_in_tick * 1000000, st->vui_time_scale);
 }
 
 static int ipmx_hrd_extract_pic_timing(IpmxStreamRT *st, int is_h265,
@@ -1489,8 +1588,8 @@ static int ipmx_hrd_extract_pic_timing(IpmxStreamRT *st, int is_h265,
     uint32_t rbsp_len;
     int ret = 0;
     int len_bits;
-    int64_t cpb_removal_delay = 0;        /* raw SEI value (H.265: +1 already applied) */
-    int64_t prospective_t_r_n;
+    int64_t cpb_removal_delay = 0;        /* raw SEI value (H.265: +1 already applied), in clock ticks */
+    int64_t prospective_ticks;
 
     rbsp = ff_nal_unit_extract_rbsp(payload, payload_size, &rbsp_len, 0);
     if (!rbsp)
@@ -1517,6 +1616,8 @@ static int ipmx_hrd_extract_pic_timing(IpmxStreamRT *st, int is_h265,
         uint32_t cpb_rm = get_bits_long(&gb, len_bits);
         cpb_removal_delay = (int64_t)cpb_rm;
     }
+    st->hrd_pt_sei_count++;
+    st->hrd_saw_pt_in_this_au = 1;
 
     /* Compute t_r,n(j) per H.264 §C.1.2 / H.265 §C.2.3 (non-concatenation branch).
      * Three cases:
@@ -1526,47 +1627,44 @@ static int ipmx_hrd_extract_pic_timing(IpmxStreamRT *st, int is_h265,
      */
     if (!st->hrd_seen_first_au) {
         /* AU 0 — HRD init. Apply C-7. */
-        st->hrd_t_r_n_j_us = st->hrd_init_delay_us;
-        st->hrd_t_r_n_n_b_us = st->hrd_t_r_n_j_us;
-        st->hrd_t_r_n_n_b_prev_us = st->hrd_t_r_n_j_us;
+        st->hrd_t_r_n_base_us        = st->hrd_init_delay_us;
+        st->hrd_t_r_n_j_ticks        = 0;
+        st->hrd_t_r_n_n_b_ticks      = 0;
+        st->hrd_t_r_n_n_b_prev_ticks = 0;
         st->hrd_seen_first_au = 1;
     } else if (st->hrd_at_new_bp) {
-        /* Eq C-8: anchored at PREVIOUS BP's first-AU t_r,n. The cached
-         * hrd_t_r_n_n_b_us is "effective" — i.e. has the cumulative anchor
-         * offset already baked in. So `prospective_t_r_n` here is the
-         * EFFECTIVE C-8 value too; we must NOT re-add hrd_anchor_offset_us
-         * (double-counting bug fixed). The anchor offset is bumped only at
-         * loop / splice detection below. */
-        st->hrd_t_r_n_n_b_prev_us = st->hrd_t_r_n_n_b_us;
-        prospective_t_r_n = st->hrd_t_r_n_n_b_prev_us +
-                            cpb_removal_delay * st->hrd_clock_tick_us;
-        /* Loop / splice detection: if the effective C-8 result would be
-         * NON-monotonic relative to the previous AU's effective t_r,n, the
-         * bitstream has restarted (stream_loop wrap). Re-anchor by bumping
-         * hrd_anchor_offset_us so this AU continues monotonically (one
-         * clock-tick past the previous AU). The override applies eq C-7
-         * with the new offset. */
-        if (prospective_t_r_n <= st->hrd_t_r_n_prev_au_us) {
-            int64_t bumped_offset = st->hrd_t_r_n_prev_au_us + st->hrd_clock_tick_us
-                                  - (st->hrd_init_delay_us + st->hrd_anchor_offset_us);
-            st->hrd_anchor_offset_us += bumped_offset;
-            st->hrd_t_r_n_j_us       = st->hrd_init_delay_us + st->hrd_anchor_offset_us;
-            st->hrd_t_r_n_n_b_us     = st->hrd_t_r_n_j_us;
+        /* Eq C-8: anchored at PREVIOUS BP's first-AU t_r,n (a re-anchored
+         * one included). */
+        st->hrd_t_r_n_n_b_prev_ticks = st->hrd_t_r_n_n_b_ticks;
+        prospective_ticks = st->hrd_t_r_n_n_b_prev_ticks + cpb_removal_delay;
+        /* Loop / splice detection: if the C-8 result would be NON-monotonic
+         * relative to the previous AU's t_r,n, the bitstream has restarted
+         * (stream_loop wrap). Re-anchor: this AU continues the removal
+         * schedule one AU interval past the previous AU — the last observed
+         * t_r,n step, i.e. the encoder's own cpb_removal_delay increment.
+         * One clock tick is not one AU: for H.264, time_scale usually
+         * counts fields (2 ticks per frame). hrd_anchor_offset_us reports
+         * the shift relative to eq C-7 for this AU's init_delay. */
+        if (prospective_ticks <= st->hrd_t_r_n_prev_au_ticks) {
+            int64_t step_ticks = st->hrd_t_r_n_step_ticks > 0 ? st->hrd_t_r_n_step_ticks : 1;
+            st->hrd_t_r_n_j_ticks    = st->hrd_t_r_n_prev_au_ticks + step_ticks;
+            st->hrd_t_r_n_n_b_ticks  = st->hrd_t_r_n_j_ticks;
+            st->hrd_anchor_offset_us = ipmx_hrd_t_r_n_us(st, st->hrd_t_r_n_j_ticks) -
+                                       st->hrd_init_delay_us;
             av_log(log_ctx, AV_LOG_VERBOSE,
-                   "IPMX HRD re-anchor at AU=%d; anchor_offset=%lld µs, "
+                   "IPMX HRD re-anchor at AU=%d; step=%lld ticks anchor_offset=%lld µs, "
                    "init_delay matches first=%s\n",
-                   st->hrd_au_idx, (long long)st->hrd_anchor_offset_us,
+                   st->hrd_au_idx, (long long)step_ticks, (long long)st->hrd_anchor_offset_us,
                    (st->hrd_init_delay_us == st->hrd_init_delay_first_us) ? "yes" : "no");
         } else {
-            st->hrd_t_r_n_j_us   = prospective_t_r_n;   /* already effective */
-            st->hrd_t_r_n_n_b_us = st->hrd_t_r_n_j_us;
+            st->hrd_t_r_n_j_ticks   = prospective_ticks;
+            st->hrd_t_r_n_n_b_ticks = st->hrd_t_r_n_j_ticks;
         }
     } else {
-        /* Eq C-9: anchored at CURRENT BP's first-AU t_r,n. Both terms are
-         * effective; result is effective. */
-        st->hrd_t_r_n_j_us = st->hrd_t_r_n_n_b_us +
-                             cpb_removal_delay * st->hrd_clock_tick_us;
+        /* Eq C-9: anchored at CURRENT BP's first-AU t_r,n. */
+        st->hrd_t_r_n_j_ticks = st->hrd_t_r_n_n_b_ticks + cpb_removal_delay;
     }
+    st->hrd_t_r_n_j_us = ipmx_hrd_t_r_n_us(st, st->hrd_t_r_n_j_ticks);
 
     /* Refine comp_pace_epoch_us per H.264 §C.1.1 / H.265 §C.2.1.1:
      *   - AU 0 (hrd_au_idx == 0): pacing epoch already set to stream epoch
@@ -1590,7 +1688,9 @@ static int ipmx_hrd_extract_pic_timing(IpmxStreamRT *st, int is_h265,
         }
         /* tai_earliest_us is relative to stream_epoch (t_r,n is relative too
          * after anchor_offset application). t_af_prev_us is also relative to
-         * stream_epoch. So both are in the same frame. */
+         * stream_epoch. So both are in the same frame. The HRD ceiling
+         * (ipmx_hrd_apply_ceiling) never pulls the pace below it. */
+        st->hrd_tai_earliest_wall_us = st->epoch_us + tai_earliest_us;
         if (tai_earliest_us > st->hrd_t_af_prev_us) {
             /* Encoder declared a stall — wire goes idle until tai_earliest(j).
              * MUST clamp upward only: the marker handler in the previous AU
@@ -1728,84 +1828,102 @@ static void ipmx_hrd_au_nal_cb(const uint8_t *nal, int nal_len, void *opaque)
     }
 }
 
-/* Per-RTP-packet driver. Walks the packet's NAL units (after the RTP header)
- * and dispatches SEI NALs to the HRD walker. Handles single-NAL packets and
- * STAP-A aggregations transparently — for RFC 6184/7798 single-NAL mode (our
- * test media's libx264/libx265 default), each RTP packet contains one NAL
- * unit. For STAP-A (H.264) / AP (H.265), each packet contains multiple NALs.
- * Both are walked correctly by ipmx_walk_annexb-equivalent logic adapted for
- * RTP framing.
- *
- * NOTE: we do NOT scan FU-A fragmented NALUs (large VCL slices); HRD SEIs are
- * always small and never fragmented. The walk simply ignores fragments.
- *
- * Callers: ipmx_avio_write — once per RTP packet for compressed-video streams
- * with hrd_present == 1. The packet at *buf includes the 12-byte RTP header. */
-static void ipmx_hrd_process_packet(IpmxStreamRT *st, int is_h265,
-                                    const uint8_t *buf, int buf_size,
-                                    void *log_ctx)
+/* Walk the NAL units of one H.264/H.265 access unit (an AVPacket), split
+ * exactly as ff_rtp_send_h264_hevc() splits it: length-prefixed when
+ * nal_length_size > 0, Annex B otherwise. This is the clear access unit; RTP
+ * packetisation and PEP / HKEP encryption happen afterwards, inside the
+ * child RTP muxer. */
+static void ipmx_walk_au_nal_units(const uint8_t *buf, int size, int nal_length_size,
+                                   void (*cb)(const uint8_t *nal, int nal_len, void *opaque),
+                                   void *opaque)
 {
-    int rtp_hlen = 12;
-    int first_nal_type;
-    if (buf_size <= 12) return;
-    if (buf[0] & 0x10) {
-        /* RTP X bit (header extension). Skip the extension. */
-        if (buf_size < 16) return;
-        rtp_hlen += 4 + AV_RB16(buf + 14) * 4;
-        if (buf_size < rtp_hlen) return;
-    }
-    if (buf_size <= rtp_hlen + 1) return;
+    const uint8_t *r, *end = buf + size;
 
-    /* RFC 6184 §5.4 / RFC 7798 §4.4: distinguish single-NAL, STAP-A/AP, FU-A.
-     * For H.264, the first byte after RTP is the NAL header; nal_type = byte & 0x1f.
-     *   - nal_type 1-23: single NAL → walk as one NAL.
-     *   - 24 (STAP-A):   aggregated NALs prefixed by u16 size.
-     *   - 25-27 (STAP-B, MTAP16, MTAP24): not used by libx264; skip.
-     *   - 28 (FU-A) / 29 (FU-B): fragmented VCL — skip (never carries SEI).
-     * For H.265, similar but: 48 = AP (aggregation), 49 = FU. */
-    {
-        IpmxHrdAuCtx cx = { .st = st, .is_h265 = is_h265, .log_ctx = log_ctx };
-        if (is_h265) {
-            first_nal_type = (buf[rtp_hlen] >> 1) & 0x3f;
-            if (first_nal_type == 48) {
-                /* H.265 AP: aggregated NALs, each prefixed by u16 size. The
-                 * AP header is 2 bytes (same nal header structure). */
-                int p = rtp_hlen + 2;
-                while (p + 2 <= buf_size) {
-                    int sz = AV_RB16(buf + p);
-                    p += 2;
-                    if (sz < 1 || p + sz > buf_size) break;
-                    ipmx_hrd_au_nal_cb(buf + p, sz, &cx);
-                    p += sz;
-                }
-            } else if (first_nal_type == 49) {
-                /* FU — skip (fragmented; we only care about SEI which is short). */
-                return;
-            } else if (first_nal_type < 48) {
-                /* Single NAL. */
-                ipmx_hrd_au_nal_cb(buf + rtp_hlen, buf_size - rtp_hlen, &cx);
-            }
+    if (nal_length_size)
+        r = ff_nal_mp4_find_startcode(buf, end, nal_length_size) ? buf : end;
+    else
+        r = ff_nal_find_startcode(buf, end);
+    while (r < end) {
+        const uint8_t *r1;
+        if (nal_length_size) {
+            r1 = ff_nal_mp4_find_startcode(r, end, nal_length_size);
+            if (!r1)
+                r1 = end;
+            r += nal_length_size;
         } else {
-            first_nal_type = buf[rtp_hlen] & 0x1f;
-            if (first_nal_type == 24) {
-                /* H.264 STAP-A: NAL HDR (1 byte) + repeating { u16 size + NAL bytes }. */
-                int p = rtp_hlen + 1;
-                while (p + 2 <= buf_size) {
-                    int sz = AV_RB16(buf + p);
-                    p += 2;
-                    if (sz < 1 || p + sz > buf_size) break;
-                    ipmx_hrd_au_nal_cb(buf + p, sz, &cx);
-                    p += sz;
-                }
-            } else if (first_nal_type == 28 || first_nal_type == 29) {
-                /* FU-A / FU-B — skip. */
-                return;
-            } else if (first_nal_type <= 23) {
-                /* Single NAL. */
-                ipmx_hrd_au_nal_cb(buf + rtp_hlen, buf_size - rtp_hlen, &cx);
-            }
+            while (!*(r++));
+            r1 = ff_nal_find_startcode(r, end);
         }
+        cb(r, r1 - r, opaque);
+        r = r1;
     }
+}
+
+/* Per-NAL work on the clear access unit (ipmx_write_packet):
+ *   - NAL unit byte count: b(n) of H.264 eq C-6 / sizeInbits of H.265 eq C-8
+ *     (÷ 8) at the Type II conformance point, which counts "all bytes of the
+ *     Type II bitstream, which may be a NAL unit stream or a byte stream"
+ *     (H.264 / H.265 §C.1). RFC 6184 / RFC 7798 carry this NAL unit stream;
+ *     start codes, length prefixes, payload-format headers (FU, STAP-A, AP)
+ *     and PEP MACs are not part of it.
+ *   - in-band parameter-set cache refresh (MIB 0x000A / 0x0009);
+ *   - HRD SEI walker (buffering_period / pic_timing / recovery_point). */
+typedef struct IpmxAuNalCtx {
+    IpmxStreamRT *st;
+    int           is_h265;
+    void         *log_ctx;
+    int64_t       nal_unit_bytes;
+} IpmxAuNalCtx;
+
+static void ipmx_au_nal_cb(const uint8_t *nal, int nal_len, void *opaque)
+{
+    IpmxAuNalCtx *cx = opaque;
+    IpmxNalCacheCtx cache = { .st = cx->st, .is_h265 = cx->is_h265 };
+
+    cx->nal_unit_bytes += nal_len;
+    ipmx_cache_nal_cb(nal, nal_len, &cache);
+    if (cx->st->hrd_present) {
+        IpmxHrdAuCtx hrd = { .st = cx->st, .is_h265 = cx->is_h265, .log_ctx = cx->log_ctx };
+        ipmx_hrd_au_nal_cb(nal, nal_len, &hrd);
+    }
+}
+
+/* HRD ceiling for AU j > 0 (ipmx_write_packet, after the AU's NAL walk and
+ * before its first RTP packet). The previous AU's marker set the pace to the
+ * lower bound max(frame_epoch(j), t_af(j-1)), and the pic_timing walker may
+ * have raised it to the eq C-3 tai_earliest(j). That cumulative MAX can walk
+ * upward without bound, so the pace is capped where AU j's last byte still
+ * arrives by its removal time:
+ *
+ *   ceiling(j) = epoch + t_r,n(j) − drain(j),  drain(j) = b(j)·8 / BitRate
+ *
+ * with this AU's own t_r,n (pic_timing SEI) and NAL unit bytes. Capping below
+ * t_af(j-1) starts AU j before AU j-1's last byte (eq C-2 / C-3 not met) to
+ * keep t_af(j) ≤ t_r,n(j). The pace never goes below frame_epoch(j)
+ * (SR-before-AU) or tai_earliest(j); when the ceiling lies below those, AU
+ * j's last byte is late and the marker's "HRD violation" diagnostic reports
+ * it. */
+static void ipmx_hrd_apply_ceiling(IpmxStreamRT *st, void *log_ctx)
+{
+    int64_t drain_us, ceiling_us, capped_us;
+
+    st->hrd_clamp_this_au_us = 0;
+    if (!st->hrd_present || st->hrd_au_idx == 0 || !st->hrd_saw_pt_in_this_au ||
+        st->hrd_max_bitrate_bps <= 0)
+        return;
+    drain_us   = (int64_t)((double)st->comp_au_nal_unit_bytes * 8.0 * 1e6 /
+                           (double)st->hrd_max_bitrate_bps);
+    ceiling_us = st->epoch_us + st->hrd_t_r_n_j_us - drain_us;
+    capped_us  = FFMAX(ceiling_us, FFMAX(st->frame_epoch_us, st->hrd_tai_earliest_wall_us));
+    if (capped_us >= st->comp_pace_epoch_us)
+        return;
+    st->hrd_clamp_this_au_us = st->comp_pace_epoch_us - capped_us;
+    av_log(log_ctx, AV_LOG_VERBOSE,
+           "IPMX HRD-ceiling clamp at AU=%d: pace reduced by %lld µs to keep t_af ≤ t_r,n "
+           "(ceiling %lld µs below the pace)\n",
+           st->hrd_au_idx, (long long)st->hrd_clamp_this_au_us,
+           (long long)(st->comp_pace_epoch_us - ceiling_us));
+    st->comp_pace_epoch_us = capped_us;
 }
 
 /* Base64 encoder (RFC 4648, no line breaks) — writes encoded bytes into out
@@ -1944,6 +2062,94 @@ static uint32_t ipmx_reverse_bits32(uint32_t v)
     return r;
 }
 
+/* Parse the HEVC profile_tier_level block from the cached SPS RBSP into the
+ * IpmxStreamRT.hevc_* fields. Same byte-walk as the inline parse that was in
+ * ipmx_build_h265_mib (now reused both by the MIB builder and the SDP fmtp
+ * augmentation in ipmx_sdp_emit_video_compressed_block, which needs the PTL
+ * values to emit the RFC 7798 / BCP-006-03 NMOS fmtp parameters
+ *   profile-space=, profile-id=, tier-flag=, level-id=,
+ *   profile-compatibility-indicator=, interop-constraints=
+ *
+ * Steps (per H.265 §7.3.2.1.1 / §7.3.3 + RFC 7798 §7.2):
+ *   1. skip 2-byte NAL header
+ *   2. strip emulation-prevention bytes (00 00 03 → 00 00)
+ *   3. rbsp[1]            = (profile_space << 6) | (tier_flag << 5) | profile_idc
+ *      rbsp[2:6]          = profile_compatibility_flag[32] (MSB-first)
+ *      rbsp[6:12]         = general_constraint_indicator_flags (48 bits, big-endian)
+ *      rbsp[12]           = general_level_idc
+ *
+ * On success populates st->hevc_* and sets st->hevc_ptl_valid = 1.
+ * On absent/malformed SPS leaves the fields zero and hevc_ptl_valid = 0. */
+static void ipmx_extract_h265_ptl(IpmxStreamRT *st)
+{
+    uint8_t rbsp[64];
+    int rbsp_len = 0;
+    int i;
+
+    st->hevc_ptl_valid = 0;
+    if (!st->sps_data || st->sps_len < 15)
+        return;
+
+    for (i = 2; i < st->sps_len && rbsp_len < (int)sizeof(rbsp); ) {
+        if (i + 2 < st->sps_len &&
+            st->sps_data[i] == 0 && st->sps_data[i+1] == 0 && st->sps_data[i+2] == 3) {
+            if (rbsp_len + 2 <= (int)sizeof(rbsp)) {
+                rbsp[rbsp_len++] = 0;
+                rbsp[rbsp_len++] = 0;
+            }
+            i += 3;
+        } else {
+            rbsp[rbsp_len++] = st->sps_data[i++];
+        }
+    }
+    if (rbsp_len < 13)
+        return;
+
+    {
+        uint8_t  ptl    = rbsp[1];
+        uint32_t compat = AV_RB32(rbsp + 2);
+        st->hevc_profile_space  = (ptl >> 6) & 0x03;
+        st->hevc_tier_flag      = (ptl >> 5) & 0x01;
+        st->hevc_profile_idc    = ptl & 0x1f;
+        st->hevc_profile_compat = ipmx_reverse_bits32(compat);
+        memcpy(st->hevc_interop_constraints, rbsp + 6, 6);
+        st->hevc_level_idc      = rbsp[12];
+        st->hevc_ptl_valid      = 1;
+    }
+}
+
+/* Base64-encode one cached H.265 parameter-set NAL unit into out (sized
+ * IPMX_H265_SPROP_MAX_CHARS) — the same characters stock sdp.c emits for
+ * sprop-vps/sps/pps. Returns the length; 0 when the NAL unit is absent or its
+ * base64 form exceeds the 1-byte MIB length field. */
+static int ipmx_h265_sprop_b64(char *out, const uint8_t *nal, int nal_len)
+{
+    int n;
+    if (!nal || nal_len <= 0)
+        return 0;
+    n = ipmx_b64_encode(out, IPMX_H265_SPROP_MAX_CHARS, nal, nal_len);
+    return n < 0 ? 0 : n;
+}
+
+/* Warn at write_header when a parameter set is too long for MIB 0x0009: the
+ * SDP still lists it, but TR-10-15b §16 caps each sprop at 255 characters, so
+ * ipmx_build_h265_mib leaves it out instead of truncating the base64. */
+static void ipmx_warn_h265_sprop_overflow(AVFormatContext *s,
+                                          const IpmxStreamRT *st, int stream_index)
+{
+    static const char *const names[3] = { "sprop-vps", "sprop-sps", "sprop-pps" };
+    const int nal_len[3] = { st->vps_len, st->sps_len, st->pps_len };
+    int i;
+    for (i = 0; i < 3; i++) {
+        int chars = ((nal_len[i] + 2) / 3) * 4;
+        if (chars > IPMX_H265_SPROP_MAX_CHARS)
+            av_log(s, AV_LOG_WARNING,
+                   "IPMX stream %d: %s is %d base64 characters, more than the %d "
+                   "MIB 0x0009 can carry (TR-10-15b §16); omitted from the MIB\n",
+                   stream_index, names[i], chars, IPMX_H265_SPROP_MAX_CHARS);
+    }
+}
+
 /* H.265 MIB type 0x0009 (TR-10-15b §16) — byte layout mirrors
  * streams/ipmx_sender_report.py H265MediaInfoBlock.to_bytes(). The PTL
  * extraction from the SPS RBSP follows
@@ -1956,40 +2162,29 @@ static int ipmx_build_h265_mib(uint8_t *p, int max, IpmxStreamRT *st)
     uint8_t profile_space = 0, profile_id = 0, level_id = 0, tier_flag = 0;
     uint32_t profile_compat = 0;
     uint8_t  interop_constraints[6] = { 0 };
+    /* sprop_{vps,sps,pps} in TR-10-15b §16 syntax: the base64 characters as
+     * represented in the SDP fmtp line. */
+    char sprop[3][IPMX_H265_SPROP_MAX_CHARS];
+    int  sprop_len[3];
     int total_payload, total_bytes, words_minus_1;
+    int i;
 
-    /* Decode profile_tier_level from SPS RBSP. Steps:
-     *   1. skip 2-byte NAL header
-     *   2. strip emulation-prevention bytes (00 00 03 → 00 00)
-     *   3. parse rbsp[1] (ptl_byte), rbsp[2:6] (compat, bit-reversed),
-     *      rbsp[6:12] (interop), rbsp[12] (level_idc). */
-    if (st->sps_data && st->sps_len >= 15) {
-        uint8_t rbsp[64];
-        int  rbsp_len = 0;
-        int  i;
-        for (i = 2; i < st->sps_len && rbsp_len < (int)sizeof(rbsp); ) {
-            if (i + 2 < st->sps_len &&
-                st->sps_data[i] == 0 && st->sps_data[i+1] == 0 && st->sps_data[i+2] == 3) {
-                if (rbsp_len + 2 <= (int)sizeof(rbsp)) {
-                    rbsp[rbsp_len++] = 0;
-                    rbsp[rbsp_len++] = 0;
-                }
-                i += 3;
-            } else {
-                rbsp[rbsp_len++] = st->sps_data[i++];
-            }
-        }
-        if (rbsp_len >= 13) {
-            uint8_t ptl = rbsp[1];
-            uint32_t compat = AV_RB32(rbsp + 2);
-            profile_space  = (ptl >> 6) & 0x03;
-            tier_flag      = (ptl >> 5) & 0x01;
-            profile_id     = ptl & 0x1f;
-            profile_compat = ipmx_reverse_bits32(compat);
-            memcpy(interop_constraints, rbsp + 6, 6);
-            level_id       = rbsp[12];
-        }
+    /* Read PTL fields from the IpmxStreamRT cache populated by
+     * ipmx_extract_h265_ptl at write_header. The same fields are reused
+     * by the SDP fmtp augmentation in ipmx_sdp_emit_video_compressed_block,
+     * so the SPS RBSP parse happens once. */
+    if (st->hevc_ptl_valid) {
+        profile_space  = st->hevc_profile_space;
+        tier_flag      = st->hevc_tier_flag;
+        profile_id     = st->hevc_profile_idc;
+        profile_compat = st->hevc_profile_compat;
+        memcpy(interop_constraints, st->hevc_interop_constraints, 6);
+        level_id       = st->hevc_level_idc;
     }
+
+    sprop_len[0] = ipmx_h265_sprop_b64(sprop[0], st->vps_data, st->vps_len);
+    sprop_len[1] = ipmx_h265_sprop_b64(sprop[1], st->sps_data, st->sps_len);
+    sprop_len[2] = ipmx_h265_sprop_b64(sprop[2], st->pps_data, st->pps_len);
 
     /* Field-presence bitmask (FIELD_BITS in streams/ipmx_sender_report.py:254): */
     mask |= 1u << 0;   /* profile_space */
@@ -1998,9 +2193,10 @@ static int ipmx_build_h265_mib(uint8_t *p, int max, IpmxStreamRT *st)
     mask |= 1u << 3;   /* tier_flag */
     mask |= 1u << 4;   /* profile_compatibility_indicator */
     mask |= 1u << 5;   /* interop_constraints */
-    if (st->vps_len > 0) mask |= 1u << 13;
-    if (st->sps_len > 0) mask |= 1u << 14;
-    if (st->pps_len > 0) mask |= 1u << 15;
+    mask |= 1u << 7;   /* tx_mode */
+    if (sprop_len[0] > 0) mask |= 1u << 13;   /* sprop_vps */
+    if (sprop_len[1] > 0) mask |= 1u << 14;   /* sprop_sps */
+    if (sprop_len[2] > 0) mask |= 1u << 15;   /* sprop_pps */
 
     if (max < payload_off + 4 + 1+1+1+1 + 4 + 6 + 2 + 4 + 4 + 2 + 2 + 1+1 + 2 + 4)
         return AVERROR(ENOSPC);
@@ -2012,7 +2208,7 @@ static int ipmx_build_h265_mib(uint8_t *p, int max, IpmxStreamRT *st)
     AV_WB32(p + payload_off, profile_compat);             payload_off += 4;
     memcpy(p + payload_off, interop_constraints, 6);      payload_off += 6;
     AV_WB16(p + payload_off, 0);                          payload_off += 2;   /* sprop_max_don_diff */
-    memset(p + payload_off, 0, 4); payload_off += 4;       /* tx_mode (4 bytes ASCII, padded) */
+    memcpy(p + payload_off, IPMX_HEVC_TX_MODE, 4);        payload_off += 4;   /* tx_mode (4 ASCII chars, as in the fmtp line) */
     AV_WB32(p + payload_off, 0);                          payload_off += 4;   /* sprop_depack_buf_bytes */
     AV_WB16(p + payload_off, 0);                          payload_off += 2;   /* sprop_depack_buf_nalus */
     AV_WB16(p + payload_off, 0);                          payload_off += 2;   /* sprop_spatial_segmentation_idc */
@@ -2020,20 +2216,16 @@ static int ipmx_build_h265_mib(uint8_t *p, int max, IpmxStreamRT *st)
     p[payload_off++] = 0;                                                   /* sprop_segmentation_id */
     AV_WB16(p + payload_off, 0);                          payload_off += 2;   /* reserved */
 
-    /* sprop_{vps,sps,pps}: raw NAL bytes (1-byte lengths, then bytes).
-     * Mirrors streams/ipmx_add_sender_reports_pcap.py:801-806. */
-    {
-        int v = st->vps_len > 0xff ? 0xff : st->vps_len;
-        int sp = st->sps_len > 0xff ? 0xff : st->sps_len;
-        int pp = st->pps_len > 0xff ? 0xff : st->pps_len;
-        if (max < payload_off + 4 + v + sp + pp) return AVERROR(ENOSPC);
-        p[payload_off++] = (uint8_t)v;
-        p[payload_off++] = (uint8_t)sp;
-        p[payload_off++] = (uint8_t)pp;
-        p[payload_off++] = 0;
-        if (v > 0)  { memcpy(p + payload_off, st->vps_data, v);  payload_off += v;  }
-        if (sp > 0) { memcpy(p + payload_off, st->sps_data, sp); payload_off += sp; }
-        if (pp > 0) { memcpy(p + payload_off, st->pps_data, pp); payload_off += pp; }
+    /* sprop_{vps,sps,pps}: 1-byte lengths (then extra_bytes length), then
+     * the base64 characters. */
+    if (max < payload_off + 4 + sprop_len[0] + sprop_len[1] + sprop_len[2])
+        return AVERROR(ENOSPC);
+    for (i = 0; i < 3; i++)
+        p[payload_off++] = (uint8_t)sprop_len[i];
+    p[payload_off++] = 0;                                                   /* extra_bytes length */
+    for (i = 0; i < 3; i++) {
+        memcpy(p + payload_off, sprop[i], sprop_len[i]);
+        payload_off += sprop_len[i];
     }
 
     /* word-boundary pad to 32-bit alignment. */
@@ -2092,8 +2284,8 @@ static int ipmx_build_video_mib(uint8_t *p, int max,
 
     AV_WB16(p + 72, width);
     AV_WB16(p + 74, height);
-    rate_field = ((uint32_t)(rate_num & 0x3fffff) << 10)
-               |  (uint32_t)(rate_den & 0x3ff);
+    rate_field = ((uint32_t)(rate_num & IPMX_MIB_RATE_NUM_MAX) << 10)
+               |  (uint32_t)(rate_den & IPMX_MIB_RATE_DEN_MAX);
     AV_WB32(p + 76, rate_field);
     AV_WB32(p + 80, (uint32_t)(meas_pixclk >> 32));
     AV_WB32(p + 84, (uint32_t)(meas_pixclk & 0xffffffffu));
@@ -2332,6 +2524,44 @@ static int ipmx_build_sr(IpmxStreamRT *st,
         if (p >= max) return AVERROR(ENOSPC);
         out[p++] = 0;
     }
+
+    /* Compound RTCP packet (RFC 3550 §6.1 / TR-10-1 §8.7): append an SDES
+     * packet carrying a CNAME item after the SR.  Stock ffmpeg (rtpenc.c)
+     * emits the SDES only when a cname is configured; IPMX *mandates* the
+     * compound packet, so we synthesise a default CNAME (ipmx@<src-ip>) when
+     * none is set. The SR length word above already covers only the SR, so
+     * the SDES stands as its own RTCP packet in the same datagram. */
+    {
+        const char *cname = (ctx->cname && ctx->cname[0]) ? ctx->cname : NULL;
+        char cname_buf[128];
+        int clen, sdes_off;
+
+        if (!cname) {
+            snprintf(cname_buf, sizeof(cname_buf), "ipmx@%s",
+                     (ctx->src_ip && ctx->src_ip[0]) ? ctx->src_ip : "127.0.0.1");
+            cname = cname_buf;
+        }
+        clen = (int)strlen(cname);
+        if (clen > 255)
+            clen = 255;
+        /* header(4) + SSRC(4) + item type(1) + item len(1) + text + null + pad(≤3) */
+        if (max - p < 10 + clen + 1 + 3)
+            return AVERROR(ENOSPC);
+
+        sdes_off = p;
+        out[p++] = (2 << 6) | 0x01;      /* V=2, P=0, SC=1 */
+        out[p++] = RTCP_PT_SDES;         /* 202 */
+        out[p++] = 0; out[p++] = 0;      /* length: filled later */
+        AV_WB32(out + p, st->ssrc);      p += 4;
+        out[p++] = SDES_ITEM_CNAME;      /* item type = 1 (CNAME) */
+        out[p++] = (uint8_t)clen;        /* item length (text only) */
+        memcpy(out + p, cname, clen);    p += clen;
+        out[p++] = 0;                    /* null item ends the chunk */
+        while ((p - sdes_off) & 3)       /* pad chunk to 32-bit boundary */
+            out[p++] = 0;
+        AV_WB16(out + sdes_off + 2, ((p - sdes_off) / 4) - 1);
+    }
+
     return p;
 }
 
@@ -3004,6 +3234,44 @@ static void ipmx_pacer_dump_trace(IpmxMuxContext *ctx, AVFormatContext *s)
     if (fp != stderr) fclose(fp);
 }
 
+/* Dump every compressed-video stream's HRD pacing trace (oldest record first). */
+static void ipmx_hrd_dump_trace(IpmxMuxContext *ctx, AVFormatContext *s)
+{
+    FILE *fp;
+    int i;
+
+    if (ctx->hrd_trace_cap <= 0) return;
+    if (ctx->hrd_trace_file && ctx->hrd_trace_file[0]) {
+        fp = fopen(ctx->hrd_trace_file, "w");
+        if (!fp) {
+            av_log(s, AV_LOG_WARNING, "Cannot open HRD trace file '%s'\n",
+                   ctx->hrd_trace_file);
+            return;
+        }
+    } else {
+        fp = stderr;
+    }
+    fprintf(fp, "# IPMX HRD pacing trace (times in µs relative to the stream epoch)\n");
+    fprintf(fp, "# stream\tau\trtp_payload_bytes\tnal_unit_bytes\tpace_us\tt_af_advance_us"
+                "\tt_r_n_us\tframe_epoch_next_us\tpace_next_us\tclamp_us\n");
+    for (i = 0; i < ctx->nb_streams; i++) {
+        const IpmxStreamRT *st = &ctx->streams[i];
+        unsigned cap = (unsigned)ctx->hrd_trace_cap, count, start, k;
+        if (!st->hrd_trace) continue;
+        count = FFMIN(st->hrd_trace_count, cap);
+        start = st->hrd_trace_count - count;
+        for (k = 0; k < count; k++) {
+            const IpmxHrdTraceEntry *e = &st->hrd_trace[(start + k) % cap];
+            fprintf(fp, "%d\t%d\t%" PRId64 "\t%" PRId64 "\t%" PRId64 "\t%" PRId64
+                        "\t%" PRId64 "\t%" PRId64 "\t%" PRId64 "\t%" PRId64 "\n",
+                    i, e->au_idx, e->rtp_payload_bytes, e->nal_unit_bytes,
+                    e->pace_us, e->t_af_advance_us, e->t_r_n_us,
+                    e->frame_epoch_next_us, e->pace_next_us, e->clamp_us);
+        }
+    }
+    if (fp != stderr) fclose(fp);
+}
+
 static void ipmx_pacer_close(IpmxMuxContext *ctx)
 {
     IpmxPacer *p = &ctx->pacer;
@@ -3144,10 +3412,10 @@ static int ipmx_avio_write(void *opaque, const uint8_t *buf, int buf_size)
          * ZERO  : AU_offset_0 = 0 (no shift; AU 0 fires immediately)
          * MAX   : AU_offset_0 = cpb_size/max_bitrate (known at init from SPS)
          * SYMM. : AU_offset_0 = cpb_size/max_bitrate − init_delay/90000
-         *           init_delay isn't yet known (lives in AU 0's BP SEI) — we
-         *           defer the SYMMETRIC offset application to AU 0's marker
-         *           handler via the AU 0 packet buffer. See the buffering
-         *           block in the compressed-video processing path below. */
+         *           init_delay comes from AU 0's BP SEI (parsed from the clear
+         *           access unit in ipmx_write_packet); the AU 0 buffering block
+         *           in the compressed-video processing path below applies it,
+         *           or falls back to 0 when AU 0 carries no BP SEI. */
         st->hrd_au_offset0_us = 0;
         if (st->hrd_present && st->hrd_max_bitrate_bps > 0 && st->hrd_cpb_size_bits > 0) {
             int64_t cpb_drain_us = (int64_t)((double)st->hrd_cpb_size_bits * 1e6 /
@@ -3244,32 +3512,9 @@ static int ipmx_avio_write(void *opaque, const uint8_t *buf, int buf_size)
             st->sr_due = 0;
         }
 
-        /* For compressed video, parse the RTP payload and refresh cached
-         * SPS/PPS/VPS if the bitstream carries new parameter sets in-band.
-         * The RTP payload begins at offset 12 + ext header; we read the
-         * NAL byte and treat aggregation packets via Annex-B-style sweep. */
-        if (st->is_compressed_video && st->pkt_buf_size > 12) {
-            int rtp_hlen = 12;
-            if (st->pkt_buf[0] & 0x10) {  /* X bit */
-                int xhdr = AV_RB16(st->pkt_buf + rtp_hlen + 2);
-                rtp_hlen += 4 + xhdr * 4;
-            }
-            if (st->pkt_buf_size > rtp_hlen + 1) {
-                int is_h265 = (st->compressed_codec_id == AV_CODEC_ID_HEVC);
-                uint8_t nal_byte = st->pkt_buf[rtp_hlen];
-                int nal_type = is_h265 ? ((nal_byte >> 1) & 0x3f) : (nal_byte & 0x1f);
-                int wanted = 0;
-                if (is_h265) wanted = (nal_type == 32 || nal_type == 33 || nal_type == 34);
-                else         wanted = (nal_type == 7 || nal_type == 8);
-                if (wanted) {
-                    /* Single-NAL packet: payload is the NAL byte(s) directly. */
-                    IpmxNalCacheCtx cx = { .st = st, .is_h265 = is_h265 };
-                    ipmx_cache_nal_cb(st->pkt_buf + rtp_hlen,
-                                      st->pkt_buf_size - rtp_hlen, &cx);
-                }
-            }
-        }
-
+        /* In-band parameter sets (cache refresh) and the HRD SEI are read
+         * from the clear access unit in ipmx_write_packet, not from these RTP
+         * packets: under PEP / HKEP their payload is already ciphertext. */
         if (st->is_compressed_video) {
             /* Compressed video — per-AU pacing per TR-10-15c §15: the AU's
              * first packet is anchored at i·T from epoch (frame_epoch_us)
@@ -3279,12 +3524,11 @@ static int ipmx_avio_write(void *opaque, const uint8_t *buf, int buf_size)
              * diagnostics. */
             st->comp_au_cum_bytes      += st->pkt_buf_size;
             st->comp_cum_payload_bytes += st->pkt_buf_size;
-            /* Also track NAL bytes (= wire payload minus RTP-header overhead)
-             * for the marker handler's t_af(j-1) computation. max_bitrate from
-             * HRD is the NAL byte rate per H.264 §E.2.2 / H.265 §E.2.2 (BitRate
-             * = (bit_rate_value_minus1[0]+1)·2^(6+bit_rate_scale)), so the inter-AU
-             * advance must use NAL bytes — not wire bytes — to remain bit-exact
-             * to eq (C-2)/(C-3). RTP header = 12 + 4·X-hdr-words. */
+            /* RTP payload bytes of the AU, for the HRD trace only. The HRD
+             * drain time uses comp_au_nal_unit_bytes instead: this payload
+             * still carries the RFC 6184/7798 payload-format headers (and,
+             * when encrypted, the PEP MAC), which are not NAL unit bytes.
+             * RTP header = 12 + 4·X-hdr-words. */
             {
                 int rtp_hlen = 12;
                 if ((st->pkt_buf[0] & 0x10) && st->pkt_buf_size >= 16) {
@@ -3292,25 +3536,16 @@ static int ipmx_avio_write(void *opaque, const uint8_t *buf, int buf_size)
                     rtp_hlen += 4 + xlen_words * 4;
                 }
                 if (st->pkt_buf_size > rtp_hlen)
-                    st->comp_au_nal_bytes += (st->pkt_buf_size - rtp_hlen);
+                    st->comp_au_rtp_payload_bytes += (st->pkt_buf_size - rtp_hlen);
             }
-            /* Per-AU SEI walker: harvest buffering_period / pic_timing /
-             * recovery_point on every packet (cheap; just walks NALU types,
-             * skips VCL). Updates st->hrd_t_r_n_j_us, st->hrd_init_delay_us,
-             * etc., used by the per-marker conformance check below. */
-            if (st->hrd_present) {
-                int is_h265 = (st->compressed_codec_id == AV_CODEC_ID_HEVC);
-                ipmx_hrd_process_packet(st, is_h265, st->pkt_buf, st->pkt_buf_size,
-                                        ctx);
-            }
-
             /* AU 0 buffering (SYMMETRIC mode only — see au_offset0_mode init at
              * first-packet block above): when AU_offset_0 has not yet been
              * computed (= !hrd_au_offset0_applied), the wire target_us for
              * this packet would use an uninitialised comp_pace_epoch_us. So we
              * buffer the packet locally and defer target_us computation until
-             * the SEI walker has populated hrd_init_delay_first_us from AU 0's
-             * BP SEI — typically AU 0's 3rd or 4th RTP packet. Then we compute
+             * hrd_init_delay_first_us is known from AU 0's BP SEI — parsed
+             * from the clear access unit before its first packet, so the
+             * buffer is flushed at that first packet. Then we compute
              * AU_offset_0 = cpb_size/max_bitrate − init_delay/90000, set
              * comp_pace_epoch_us = epoch_us + AU_offset_0, and flush the
              * buffer (push every buffered packet to st->ring with its correct
@@ -3318,6 +3553,7 @@ static int ipmx_avio_write(void *opaque, const uint8_t *buf, int buf_size)
             if (st->hrd_present && !st->hrd_au_offset0_applied) {
                 struct IpmxAuBufferedPkt *bp;
                 int pkt_marker = (st->pkt_buf[1] & 0x80) ? 1 : 0;
+                int have_bp;
                 if (st->hrd_au0_buf_count >= st->hrd_au0_buf_cap) {
                     int new_cap = st->hrd_au0_buf_cap
                                 ? st->hrd_au0_buf_cap * 2 : 16;
@@ -3338,16 +3574,25 @@ static int ipmx_avio_write(void *opaque, const uint8_t *buf, int buf_size)
                 bp->seq       = AV_RB16(st->pkt_buf + 2);
                 bp->rtp_ts    = AV_RB32(st->pkt_buf + 4);
 
-                /* Did this packet contain AU 0's BP SEI? If yes,
-                 * hrd_init_delay_first_us is now > 0. Time to compute
-                 * AU_offset_0 and flush. */
-                if (st->hrd_init_delay_first_us > 0 &&
-                    st->hrd_max_bitrate_bps > 0 && st->hrd_cpb_size_bits > 0) {
-                    int64_t cpb_drain_us = (int64_t)(
-                        (double)st->hrd_cpb_size_bits * 1e6 /
-                        (double)st->hrd_max_bitrate_bps);
+                /* AU 0's BP SEI (hrd_init_delay_first_us, parsed from the
+                 * clear access unit in ipmx_write_packet) gives AU_offset_0;
+                 * compute it and flush. If AU 0 ends without one, fall back
+                 * to AU_offset_0 = 0 instead of holding the stream back. */
+                have_bp = st->hrd_init_delay_first_us > 0 &&
+                          st->hrd_max_bitrate_bps > 0 && st->hrd_cpb_size_bits > 0;
+                if (have_bp || pkt_marker) {
+                    int64_t cpb_drain_us = st->hrd_max_bitrate_bps > 0
+                        ? (int64_t)((double)st->hrd_cpb_size_bits * 1e6 /
+                                    (double)st->hrd_max_bitrate_bps)
+                        : 0;
                     const char *mode_name;
-                    if (ctx->au_offset0_mode == IPMX_AU_OFFSET0_OFFSET) {
+                    if (!have_bp) {
+                        av_log(ctx, AV_LOG_WARNING,
+                               "IPMX: no buffering_period SEI in AU 0; "
+                               "AU_offset_0 falls back to 0\n");
+                        st->hrd_au_offset0_us = 0;
+                        mode_name = "zero (no buffering_period SEI in AU 0)";
+                    } else if (ctx->au_offset0_mode == IPMX_AU_OFFSET0_OFFSET) {
                         /* Use BP SEI initial_cpb_removal_delay_offset
                          * verbatim. Intended for encoders where the offset
                          * field is computed independently of cpb_size — e.g.
@@ -3489,12 +3734,12 @@ skip_video_push:
             /* Per-marker HRD conformance check (diagnostic only — never aborts).
              * Per H.264 §C.1.1 / H.265 §C.2.1.1: AU j's last byte must arrive
              * at the decoder CPB by t_r,n(j). t_af(j) (β-free spec-side final
-             * arrival) = comp_pace_epoch_us(j) − epoch_us + NAL_bytes·8/max_bitrate.
+             * arrival) = comp_pace_epoch_us(j) − epoch_us + NAL_unit_bytes·8/max_bitrate.
              * Compare against the cached hrd_t_r_n_j_us computed from the AU's
-             * pic_timing SEI. NAL bytes (not wire bytes) per H.264 §E.2.2 /
-             * H.265 §E.2.2 (BitRate is the NAL byte rate). */
+             * pic_timing SEI. NAL unit bytes, not RTP payload bytes (H.264 eq
+             * C-6 b(n) / H.265 eq C-8 sizeInbits). */
             if (st->hrd_present && st->hrd_seen_first_au && st->hrd_max_bitrate_bps > 0) {
-                int64_t t_af_us_rel = (int64_t)((double)st->comp_au_nal_bytes * 8.0 * 1e6 /
+                int64_t t_af_us_rel = (int64_t)((double)st->comp_au_nal_unit_bytes * 8.0 * 1e6 /
                                                 (double)st->hrd_max_bitrate_bps);
                 int64_t t_af_us = st->comp_pace_epoch_us - st->epoch_us + t_af_us_rel;
                 st->hrd_t_af_prev_us = t_af_us;
@@ -3513,17 +3758,28 @@ skip_video_push:
                        "TR-10-15c §15 violation: recovery_point SEI without accompanying "
                        "buffering_period SEI at AU=%d\n", st->hrd_au_idx);
             }
-            /* Cache previous-AU t_r,n for monotonicity / loop detection. */
-            if (st->hrd_present)
-                st->hrd_t_r_n_prev_au_us = st->hrd_t_r_n_j_us;
+            /* Cache previous-AU t_r,n for monotonicity / loop detection, and
+             * the per-AU removal interval the re-anchor continues with. */
+            if (st->hrd_present) {
+                if (st->hrd_au_idx > 0 && st->hrd_t_r_n_j_ticks > st->hrd_t_r_n_prev_au_ticks)
+                    st->hrd_t_r_n_step_ticks = st->hrd_t_r_n_j_ticks - st->hrd_t_r_n_prev_au_ticks;
+                st->hrd_t_r_n_prev_au_ticks = st->hrd_t_r_n_j_ticks;
+            }
             /* Clear per-AU scratch flags and advance AU index. */
             st->hrd_saw_bp_in_this_au = 0;
             st->hrd_saw_recovery_point_in_this_au = 0;
+            st->hrd_saw_pt_in_this_au = 0;
+            st->hrd_tai_earliest_wall_us = 0;
             st->hrd_au_idx++;
             /* TR-10-15c §15 schedule rule 1: SR cadence at the nominal frame
              * period T from stream_epoch. frame_epoch_us drives SR target
-             * computation; this advance is independent of HRD per §15. */
-            st->frame_epoch_us += st->t_frame_us;
+             * computation; this advance is independent of HRD per §15.
+             * Computed from the frame index at the exact rate, not by adding
+             * the µs-rounded t_frame_us, which ran the wire ahead of the RTP
+             * clock (−10 ppm at 30 fps, −40 ppm at 60 fps). */
+            st->frame_epoch_us = st->epoch_us +
+                                 av_rescale(st->frame_idx, (int64_t)st->rate_den * 1000000,
+                                            st->rate_num);
             /* Compressed-video AU pacing — sender-side three-way max,
              * combining the encoder pour timeline (TR-10-15c §15) with the
              * HRD model (H.264 §C.1.1 / H.265 §C.2.1.1):
@@ -3552,6 +3808,10 @@ skip_video_push:
              *      current comp_pace_epoch_us, overrides → adds eq (C-3)'s
              *      max-with-tai_earliest arm.
              *
+             *   4. HRD ceiling (ipmx_hrd_apply_ceiling, ipmx_write_packet):
+             *      caps the result at epoch + t_r,n(j) − drain(j) once AU j's
+             *      SEI and NAL unit bytes are known — see below.
+             *
              * SR cadence is locked to the encoder pour timeline at
              * T_pour(j) − 50 µs via frame_epoch_us (advanced by t_frame_us
              * above). Because wire(j) ≥ T_pour(j) by construction,
@@ -3571,17 +3831,82 @@ skip_video_push:
              * streams/ipmx_validate_hrd.py:filter_capture_boundary_orphan_srs
              * and the HRD-TIME-EQC3 implementation at line ~1189. */
             {
+                /* Cumulative MAX of T_pour(j+1) and t_af(j); AU j+1 caps it
+                 * at an absolute HRD ceiling derived from the encoder's
+                 * declared t_r,n schedule.
+                 *
+                 * The floor MAX(frame_epoch, t_af_j) realises the spec's
+                 * lower bound (encoder-pour timeline OR HRD eq C-2 chain).
+                 * The tai_earliest arm of eq C-3 is added separately by
+                 * the pic_timing SEI walker (ipmx_hrd_extract_pic_timing)
+                 * when AU j+1 is written.
+                 *
+                 * The cumulative MAX alone admits a *reflected random
+                 * walk* in G = pace − frame_epoch when the encoder has
+                 * non-zero per-AU size variance. The walk is pinned at 0
+                 * (small AUs let pace snap back to frame_epoch) but free
+                 * to drift upward by σ√(2j/π) — bytes^2/AU variance
+                 * accumulates without a sink. With NVENC's HEVC drain
+                 * stddev ≈ 6 ms, the walk reaches the 1 s init_delay
+                 * threshold in roughly init_delay²/(2σ²) ≈ 12k AUs ≈
+                 * 7 minutes, after which the per-AU t_af > t_r,n
+                 * diagnostic fires.
+                 *
+                 * To bound that walk, we cap pace at an HRD ceiling
+                 * derived from the encoder's *absolute* t_r,n schedule
+                 * (the PT SEI cpb_removal_delay sequence the encoder
+                 * publishes — fixed per-AU, not accumulated):
+                 *
+                 *   hrd_ceiling(j+1) = epoch + t_r,n(j+1) − drain(j+1)
+                 *
+                 * Both terms are AU j+1's own: ipmx_hrd_apply_ceiling
+                 * applies it in ipmx_write_packet, after AU j+1's pic_timing
+                 * SEI and NAL unit bytes are parsed and before its first
+                 * packet. (An estimate made here at AU j's marker — AU j's
+                 * drain for drain(j+1), t_r,n(j) + one clock tick for
+                 * t_r,n(j+1), which is half a frame for H.264 — clamped the
+                 * small AU after a large I-frame by ~110 ms.) The clamp may
+                 * start AU j+1 before AU j's last byte (strict t_ai =
+                 * t_af_prev rule not met) but bounds the walk so t_af stays
+                 * at or below t_r,n. It never goes below frame_epoch(j+1)
+                 * (SR-before-AU) or tai_earliest(j+1).
+                 *
+                 * A CBR source whose long-term NAL rate exceeds BitRate
+                 * also makes G grow: the t_af chain then sets the pace on
+                 * every AU and G rises by (rate excess) × elapsed time
+                 * until the ceiling triggers. The H.265 640x480p30 4M CBR
+                 * fixture (+0.22 % over BitRate) does this — G measured
+                 * from 100 ms to 152 ms over 10 s. G stays bounded by
+                 * t_r,n − frame_epoch − drain either way.
+                 */
                 int64_t t_af_advance_us = (st->hrd_present && st->hrd_max_bitrate_bps > 0)
-                    ? (int64_t)((double)st->comp_au_nal_bytes * 8.0 * 1e6 /
+                    ? (int64_t)((double)st->comp_au_nal_unit_bytes * 8.0 * 1e6 /
                                 (double)st->hrd_max_bitrate_bps)
                     : st->t_frame_us;
-                int64_t advance_us = FFMAX(st->t_frame_us, t_af_advance_us);
-                st->comp_pace_epoch_us += advance_us;
+                int64_t t_af_j_us       = st->comp_pace_epoch_us + t_af_advance_us;
+                int64_t pace_next_us    = FFMAX(st->frame_epoch_us, t_af_j_us);
+
+                if (st->hrd_trace) {
+                    IpmxHrdTraceEntry *e =
+                        &st->hrd_trace[st->hrd_trace_count++ % (unsigned)ctx->hrd_trace_cap];
+                    e->au_idx              = st->hrd_au_idx - 1;
+                    e->rtp_payload_bytes   = st->comp_au_rtp_payload_bytes;
+                    e->nal_unit_bytes      = st->comp_au_nal_unit_bytes;
+                    e->pace_us             = st->comp_pace_epoch_us - st->epoch_us;
+                    e->t_af_advance_us     = t_af_advance_us;
+                    e->t_r_n_us            = st->hrd_t_r_n_j_us;
+                    e->frame_epoch_next_us = st->frame_epoch_us - st->epoch_us;
+                    e->pace_next_us        = pace_next_us - st->epoch_us;
+                    e->clamp_us            = st->hrd_clamp_this_au_us;
+                }
+
+                st->comp_pace_epoch_us = pace_next_us;
             }
             /* Reset per-AU cumulative byte counters — the next AU's first
              * packet anchors at the new pacing epoch. */
             st->comp_au_cum_bytes = 0;
-            st->comp_au_nal_bytes = 0;
+            st->comp_au_rtp_payload_bytes = 0;
+            st->comp_au_nal_unit_bytes = 0;
             st->sr_due = 1;
         }
     } else {
@@ -3681,12 +4006,31 @@ static void ipmx_sdp_compute_tsref(IpmxMuxContext *ctx, char *out, int outsize)
     }
 }
 
+/* fmtp exactframerate value, ST 2110-20 §7.2: "Integer frame rates shall be
+ * signaled as a single decimal number (e.g. "25") whilst non-integer frame
+ * rates shall be signaled as a ratio of two integer decimal numbers
+ * separated by a "forward-slash" character (e.g. "30000/1001"), utilizing
+ * the numerically smallest numerator value possible." Used by the raw
+ * (ST 2110-20) and the compressed (ST 2110-22) video blocks alike, from the
+ * same rate the video MIB carries. */
+static void ipmx_sdp_format_exactframerate(char *out, int outsize, int rate_num, int rate_den)
+{
+    int num, den;
+
+    av_reduce(&num, &den, rate_num, rate_den, INT_MAX);
+    if (den == 1)
+        snprintf(out, outsize, "%d", num);
+    else
+        snprintf(out, outsize, "%d/%d", num, den);
+}
+
 static void ipmx_sdp_emit_video_raw_block(FILE *fp, IpmxStreamRT *st, int payload_type)
 {
     IpmxMuxContext *ctx = st->mc;
     const char *sampling = "YCbCr-4:2:0";
     int rate_num = st->rate_num > 0 ? st->rate_num : 30;
     int rate_den = st->rate_den > 0 ? st->rate_den : 1;
+    char exactframerate[32];
     char tsref[96];
 
     switch (st->pix_fmt) {
@@ -3701,6 +4045,7 @@ static void ipmx_sdp_emit_video_raw_block(FILE *fp, IpmxStreamRT *st, int payloa
     }
 
     ipmx_sdp_compute_tsref(ctx, tsref, sizeof(tsref));
+    ipmx_sdp_format_exactframerate(exactframerate, sizeof(exactframerate), rate_num, rate_den);
 
     /* Synthesised non-baseband signal-timing fields. TR-10-1 §10.2 makes
      * `measuredpixclk`, `htotal`, `vtotal` conditional on baseband input;
@@ -3722,7 +4067,7 @@ static void ipmx_sdp_emit_video_raw_block(FILE *fp, IpmxStreamRT *st, int payloa
                 "a=rtcp:%d\r\n"
                 "a=rtpmap:%d raw/90000\r\n"
                 "a=fmtp:%d sampling=%s; width=%d; height=%d; "
-                "exactframerate=%d/%d; depth=%d; colorimetry=BT709; "
+                "exactframerate=%s; depth=%d; colorimetry=BT709; "
                 "PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPW; IPMX; "
                 "TCS=SDR; RANGE=NARROW; "
                 "measuredpixclk=%" PRIu64 "; htotal=%d; vtotal=%d\r\n"
@@ -3733,7 +4078,7 @@ static void ipmx_sdp_emit_video_raw_block(FILE *fp, IpmxStreamRT *st, int payloa
                 st->dst_rtcp_port_resolved,
                 payload_type, payload_type,
                 sampling, st->width, st->height,
-                rate_num, rate_den, st->bit_depth,
+                exactframerate, st->bit_depth,
                 pixclk, st->width, st->height,
                 ctx->mediaclk ? ctx->mediaclk : "sender",
                 tsref);
@@ -3757,6 +4102,7 @@ static void ipmx_sdp_emit_video_compressed_block(FILE *fp, IpmxStreamRT *st,
     char *line, *saveptr = NULL;
     char  rtpmap_line[512] = "";
     char  fmtp_line[2048] = "";
+    char  exactframerate[32];
     char  tsref[96];
     int   rate_num = st->rate_num > 0 ? st->rate_num : 30;
     int   rate_den = st->rate_den > 0 ? st->rate_den : 1;
@@ -3779,19 +4125,24 @@ static void ipmx_sdp_emit_video_compressed_block(FILE *fp, IpmxStreamRT *st,
     }
 
     ipmx_sdp_compute_tsref(ctx, tsref, sizeof(tsref));
+    ipmx_sdp_format_exactframerate(exactframerate, sizeof(exactframerate), rate_num, rate_den);
 
     /* Emit the IPMX-conformant block. The IPMX flag goes into fmtp; if FFmpeg
      * already emitted a fmtp line we append "; IPMX" to it, otherwise we
      * synthesise a minimal one. */
+    /* RFC 4566 §5 media-description ordering: m=, then i= (optional),
+     * c=, b=*, k= (optional), a=*. b= MUST precede every a= line. The
+     * grammar isn't ambiguous about this — `b=` belongs between `c=`
+     * and the first `a=`. */
     fprintf(fp,
             "m=video %d RTP/AVP %d\r\n"
             "c=IN IP4 %s/64\r\n"
-            "a=rtcp:%d\r\n"
-            "b=AS:%" PRId64 "\r\n",
+            "b=AS:%" PRId64 "\r\n"
+            "a=rtcp:%d\r\n",
             st->dst_port_resolved, payload_type,
             st->dst_ip_resolved,
-            st->dst_rtcp_port_resolved,
-            (st->comp_max_bitrate_bps + 999) / 1000);  /* kbps, rounded up */
+            (st->comp_max_bitrate_bps + 999) / 1000,  /* kbps, rounded up */
+            st->dst_rtcp_port_resolved);
 
     if (rtpmap_line[0])
         fprintf(fp, "%s\r\n", rtpmap_line);
@@ -3820,30 +4171,107 @@ static void ipmx_sdp_emit_video_compressed_block(FILE *fp, IpmxStreamRT *st,
          * "invalid height" if md.width / md.height parse to 0). FFmpeg's
          * H.264/H.265 fmtp line normally carries dimensions only inside
          * the SPS/sprop-parameter-sets, so we add them explicitly here.
+         * The frame rate is the fmtp exactframerate parameter, as for raw
+         * video (ST 2110-22 also accepts a=framerate; the TR-10-15b / -15c
+         * §16.1 example SDPs use exactframerate).
          * htotal/vtotal stay (TR-10-1 §10.2 IPMX-specific, separate). */
         av_strlcatf(with_ipmx, sizeof(with_ipmx),
-                    "; width=%d; height=%d; TP=2110TPW; measuredpixclk=%" PRIu64
+                    "; width=%d; height=%d; exactframerate=%s; TP=2110TPW; measuredpixclk=%" PRIu64
                     "; htotal=%d; vtotal=%d",
-                    st->width, st->height,
+                    st->width, st->height, exactframerate,
                     pixclk, st->width, st->height);
+
+        /* H.265 NMOS / BCP-006-03 fmtp augmentation. RFC 7798 §7.1 and
+         * AMWA BCP-006-03 require the SDP to carry the SPS profile_tier_level
+         * fields plus tx-mode so a Receiver / NMOS Controller can negotiate
+         * stream compatibility without parsing the bitstream. FFmpeg's stock
+         * av_sdp_create() emits sprop-vps / sprop-sps / sprop-pps but none
+         * of these PTL fields; we add them here.
+         *
+         * Policy: ALWAYS emit (unconditional) — matches existing IPMX-side
+         * SDP convention (raw video's colorimetry=BT709 / TCS=SDR / RANGE=NARROW
+         * / measuredpixclk / htotal / vtotal, audio's measuredsamplerate;
+         * all hard-coded without default-omission). BCP-006-03 explicitly
+         * permits omitting defaults, but emitting unconditionally is
+         * over-compliant and gives diagnostic clarity. strstr() guards keep
+         * the patch idempotent if FFmpeg's stock emitter ever adds these.
+         *
+         * tx-mode=SRST is mandatory per BCP-006-03 (no default — Single RTP
+         * Stream Transport is the only mode the spec defines for declarative
+         * SDP). */
+        if (st->compressed_codec_id == AV_CODEC_ID_HEVC) {
+            if (!strstr(with_ipmx, "tx-mode="))
+                av_strlcatf(with_ipmx, sizeof(with_ipmx), "; tx-mode=" IPMX_HEVC_TX_MODE);
+            if (st->hevc_ptl_valid) {
+                if (!strstr(with_ipmx, "profile-space="))
+                    av_strlcatf(with_ipmx, sizeof(with_ipmx),
+                                "; profile-space=%u", st->hevc_profile_space);
+                if (!strstr(with_ipmx, "profile-id="))
+                    av_strlcatf(with_ipmx, sizeof(with_ipmx),
+                                "; profile-id=%u", st->hevc_profile_idc);
+                if (!strstr(with_ipmx, "tier-flag="))
+                    av_strlcatf(with_ipmx, sizeof(with_ipmx),
+                                "; tier-flag=%u", st->hevc_tier_flag);
+                if (!strstr(with_ipmx, "level-id="))
+                    av_strlcatf(with_ipmx, sizeof(with_ipmx),
+                                "; level-id=%u", st->hevc_level_idc);
+                if (!strstr(with_ipmx, "profile-compatibility-indicator="))
+                    av_strlcatf(with_ipmx, sizeof(with_ipmx),
+                                "; profile-compatibility-indicator=%08X",
+                                st->hevc_profile_compat);
+                if (!strstr(with_ipmx, "interop-constraints="))
+                    av_strlcatf(with_ipmx, sizeof(with_ipmx),
+                                "; interop-constraints=%02X%02X%02X%02X%02X%02X",
+                                st->hevc_interop_constraints[0],
+                                st->hevc_interop_constraints[1],
+                                st->hevc_interop_constraints[2],
+                                st->hevc_interop_constraints[3],
+                                st->hevc_interop_constraints[4],
+                                st->hevc_interop_constraints[5]);
+            }
+        }
+
         if (!strstr(with_ipmx, " IPMX") && !strstr(with_ipmx, ";IPMX"))
             av_strlcatf(with_ipmx, sizeof(with_ipmx), "; IPMX");
         fprintf(fp, "%s\r\n", with_ipmx);
     } else {
+        /* Fallback path — av_sdp_create() failed to emit an a=fmtp line.
+         * Synthesise a minimal one with the IPMX-side extras, plus the H.265
+         * NMOS PTL fields when applicable. In practice this branch is
+         * unreachable for H.264/H.265 with non-empty extradata. */
         uint64_t pixclk = (uint64_t)st->width * (uint64_t)st->height *
                           (uint64_t)rate_num / (uint64_t)rate_den;
-        fprintf(fp,
-                "a=fmtp:%d width=%d; height=%d; TP=2110TPW; measuredpixclk=%" PRIu64
-                "; htotal=%d; vtotal=%d; IPMX\r\n",
-                payload_type, st->width, st->height,
-                pixclk, st->width, st->height);
+        char synth_fmtp[1024];
+        snprintf(synth_fmtp, sizeof(synth_fmtp),
+                 "a=fmtp:%d width=%d; height=%d; exactframerate=%s; TP=2110TPW; measuredpixclk=%" PRIu64
+                 "; htotal=%d; vtotal=%d",
+                 payload_type, st->width, st->height, exactframerate,
+                 pixclk, st->width, st->height);
+        if (st->compressed_codec_id == AV_CODEC_ID_HEVC) {
+            av_strlcatf(synth_fmtp, sizeof(synth_fmtp), "; tx-mode=" IPMX_HEVC_TX_MODE);
+            if (st->hevc_ptl_valid) {
+                av_strlcatf(synth_fmtp, sizeof(synth_fmtp),
+                            "; profile-space=%u; profile-id=%u; tier-flag=%u; level-id=%u"
+                            "; profile-compatibility-indicator=%08X"
+                            "; interop-constraints=%02X%02X%02X%02X%02X%02X",
+                            st->hevc_profile_space, st->hevc_profile_idc,
+                            st->hevc_tier_flag,    st->hevc_level_idc,
+                            st->hevc_profile_compat,
+                            st->hevc_interop_constraints[0],
+                            st->hevc_interop_constraints[1],
+                            st->hevc_interop_constraints[2],
+                            st->hevc_interop_constraints[3],
+                            st->hevc_interop_constraints[4],
+                            st->hevc_interop_constraints[5]);
+            }
+        }
+        av_strlcatf(synth_fmtp, sizeof(synth_fmtp), "; IPMX");
+        fprintf(fp, "%s\r\n", synth_fmtp);
     }
 
     fprintf(fp,
-            "a=framerate:%g\r\n"
             "a=mediaclk:%s\r\n"
             "a=ts-refclk:%s\r\n",
-            (double)rate_num / (double)rate_den,
             ctx->mediaclk ? ctx->mediaclk : "sender",
             tsref);
     ipmx_sdp_emit_source_filter(fp, st->dst_ip_resolved, ctx->src_ip);
@@ -4104,6 +4532,90 @@ static void ipmx_write_sdp_file(IpmxMuxContext *ctx, AVFormatContext *s)
 
 /* ─────────────── per-stream setup ─────────────── */
 
+/* Nominal frame rate (N or N·1000/1001 fps) within
+ * IPMX_FRAME_RATE_SNAP_TOLERANCE of num/den, if any. */
+static int ipmx_snap_frame_rate(int64_t num, int64_t den, int *out_num, int *out_den)
+{
+    double fps    = (double)num / (double)den;
+    double n_int  = round(fps);
+    double n_1001 = round(fps * 1.001);
+
+    if (n_int >= 1 && n_int <= IPMX_MIB_RATE_NUM_MAX &&
+        fabs(fps - n_int) <= IPMX_FRAME_RATE_SNAP_TOLERANCE * fps) {
+        *out_num = (int)n_int;
+        *out_den = 1;
+        return 1;
+    }
+    if (n_1001 >= 1 && n_1001 * 1000 <= IPMX_MIB_RATE_NUM_MAX &&
+        fabs(fps - n_1001 * 1000.0 / 1001.0) <= IPMX_FRAME_RATE_SNAP_TOLERANCE * fps) {
+        *out_num = (int)n_1001 * 1000;
+        *out_den = 1001;
+        return 1;
+    }
+    return 0;
+}
+
+/* Frame rate of a video stream: the video MIB rate field, the SDP
+ * exactframerate and the frame epoch cadence all use it.
+ *   - H.264 / H.265: the SPS VUI timing, which TR-10-15c / -15b require to
+ *     carry the frame rate (H.264: num_units_in_tick = frame rate
+ *     denominator, time_scale = twice its numerator; H.265:
+ *     vui_num_units_in_tick = denominator, vui_time_scale = numerator).
+ *   - Otherwise (no VUI timing, raw video): the container rate
+ *     (avg_frame_rate, else r_frame_rate), taken as the nominal N or
+ *     N·1000/1001 rate it is within IPMX_FRAME_RATE_SNAP_TOLERANCE of.
+ * A rate the MIB rate field cannot carry is approximated, with a warning. */
+static void ipmx_select_video_rate(AVFormatContext *s, IpmxStreamRT *st,
+                                   const AVStream *src_st, int codec_id)
+{
+    AVRational container = src_st->avg_frame_rate;
+    const char *source;
+    int num = 30, den = 1;
+
+    if (container.num <= 0 || container.den <= 0)
+        container = src_st->r_frame_rate;
+
+    if (st->is_compressed_video && st->vui_time_scale && st->vui_num_units_in_tick) {
+        int64_t ticks_per_frame = codec_id == AV_CODEC_ID_H264 ? 2 : 1;
+        av_reduce(&num, &den, st->vui_time_scale,
+                  ticks_per_frame * st->vui_num_units_in_tick, INT_MAX);
+        source = "SPS VUI timing";
+        if (container.num > 0 && container.den > 0 &&
+            fabs(av_q2d(container) - (double)num / den) >
+            IPMX_FRAME_RATE_SNAP_TOLERANCE * ((double)num / den))
+            av_log(s, AV_LOG_WARNING,
+                   "IPMX stream=%d: SPS VUI timing gives %d/%d fps but the container "
+                   "%d/%d fps; using the SPS rate\n",
+                   (int)(st - st->mc->streams), num, den, container.num, container.den);
+    } else if (container.num > 0 && container.den > 0) {
+        source = "container (nominal rate)";
+        if (!ipmx_snap_frame_rate(container.num, container.den, &num, &den)) {
+            av_reduce(&num, &den, container.num, container.den, INT_MAX);
+            source = "container";
+        }
+    } else {
+        source = "default (no rate signalled)";
+    }
+
+    if (num > IPMX_MIB_RATE_NUM_MAX || den > IPMX_MIB_RATE_DEN_MAX) {
+        int approx_num, approx_den;
+        if (!ipmx_snap_frame_rate(num, den, &approx_num, &approx_den))
+            av_reduce(&approx_num, &approx_den, num, den, IPMX_MIB_RATE_DEN_MAX);
+        av_log(s, AV_LOG_WARNING,
+               "IPMX stream=%d: frame rate %d/%d does not fit the video MIB rate field "
+               "(22-bit numerator, 10-bit denominator); using %d/%d\n",
+               (int)(st - st->mc->streams), num, den, approx_num, approx_den);
+        num = approx_num;
+        den = approx_den;
+    }
+
+    st->rate_num   = num;
+    st->rate_den   = den;
+    st->t_frame_us = (int64_t)1000000 * den / num;
+    av_log(s, AV_LOG_VERBOSE, "IPMX stream=%d: frame rate %d/%d fps from %s\n",
+           (int)(st - st->mc->streams), num, den, source);
+}
+
 static int ipmx_setup_stream(AVFormatContext *s, IpmxStreamRT *st,
                              AVStream *src_st, int idx,
                              const char *host, int port,
@@ -4128,22 +4640,6 @@ static int ipmx_setup_stream(AVFormatContext *s, IpmxStreamRT *st,
         st->width  = src_st->codecpar->width;
         st->height = src_st->codecpar->height;
         st->pix_fmt = src_st->codecpar->format;
-        if (src_st->avg_frame_rate.num && src_st->avg_frame_rate.den) {
-            st->rate_num   = src_st->avg_frame_rate.num;
-            st->rate_den   = src_st->avg_frame_rate.den;
-            st->t_frame_us = (int64_t)1000000 *
-                              src_st->avg_frame_rate.den /
-                              src_st->avg_frame_rate.num;
-        } else if (src_st->r_frame_rate.num && src_st->r_frame_rate.den) {
-            st->rate_num   = src_st->r_frame_rate.num;
-            st->rate_den   = src_st->r_frame_rate.den;
-            st->t_frame_us = (int64_t)1000000 *
-                              src_st->r_frame_rate.den /
-                              src_st->r_frame_rate.num;
-        } else {
-            st->rate_num = 30; st->rate_den = 1;
-            st->t_frame_us = 1000000 / 30;
-        }
 
         if (codec_id == AV_CODEC_ID_H264 || codec_id == AV_CODEC_ID_HEVC) {
             /* Compressed video — H.264 (RFC 6184 / TR-10-15c) or H.265
@@ -4162,6 +4658,18 @@ static int ipmx_setup_stream(AVFormatContext *s, IpmxStreamRT *st,
                                       src_st->codecpar->extradata,
                                       src_st->codecpar->extradata_size,
                                       codec_id == AV_CODEC_ID_HEVC);
+            }
+            /* HEVC: parse the SPS profile_tier_level block into the
+             * st->hevc_* cache. Used by ipmx_build_h265_mib (replaces its
+             * inline parse) and by the SDP fmtp augmentation. */
+            if (codec_id == AV_CODEC_ID_HEVC) {
+                ipmx_extract_h265_ptl(st);
+                ipmx_warn_h265_sprop_overflow(s, st, (int)(st - ctx->streams));
+            }
+            if (ctx->hrd_trace_cap > 0) {
+                st->hrd_trace = av_calloc(ctx->hrd_trace_cap, sizeof(*st->hrd_trace));
+                if (!st->hrd_trace)
+                    return AVERROR(ENOMEM);
             }
             /* Parse SPS VUI HRD parameters (TR-10-15c / TR-10-15b §15,
              * H.264 §C.1.1 / H.265 §C.2.1.1). On success populates
@@ -4182,13 +4690,13 @@ static int ipmx_setup_stream(AVFormatContext *s, IpmxStreamRT *st,
                 st->comp_max_bitrate_bps = st->hrd_max_bitrate_bps;
                 av_log(s, AV_LOG_VERBOSE,
                        "IPMX HRD: stream=%d codec=%s cbr_flag=%d "
-                       "max_bitrate=%lld bps cpb_size=%lld bits clock_tick=%lld µs\n",
+                       "max_bitrate=%lld bps cpb_size=%lld bits clock_tick=%u/%u s\n",
                        (int)(st - ctx->streams),
                        codec_id == AV_CODEC_ID_H264 ? "H.264" : "H.265",
                        st->hrd_cbr_flag,
                        (long long)st->hrd_max_bitrate_bps,
                        (long long)st->hrd_cpb_size_bits,
-                       (long long)st->hrd_clock_tick_us);
+                       st->vui_num_units_in_tick, st->vui_time_scale);
             } else if (src_st->codecpar->bit_rate > 0) {
                 st->comp_max_bitrate_bps = src_st->codecpar->bit_rate;
                 av_log(s, AV_LOG_WARNING,
@@ -4241,6 +4749,8 @@ static int ipmx_setup_stream(AVFormatContext *s, IpmxStreamRT *st,
                     st->width, st->height, st->pgroup_octets,
                     rf->xinc, rf->yinc, st->payload_size);
         }
+        /* After ipmx_extract_sps_hrd: H.264 / H.265 take it from the SPS. */
+        ipmx_select_video_rate(s, st, src_st, codec_id);
     } else {
         /* Audio stream (TR-10-1 §8.10.1, AES67 §7.5). */
         int codec_id = src_st->codecpar->codec_id;
@@ -4520,6 +5030,7 @@ fail:
         avio_context_free(&st->paced_avio);
     }
     av_freep(&st->pkt_buf);
+    av_freep(&st->hrd_trace);
     if (st->hrd_au0_buf) {
         int i;
         for (i = 0; i < st->hrd_au0_buf_count; i++)
@@ -4693,6 +5204,25 @@ static int ipmx_write_packet(AVFormatContext *s, AVPacket *pkt)
     st = &ctx->streams[pkt->stream_index];
     if (!st->child_rtp_ctx) return AVERROR(EINVAL);
 
+    /* One AVPacket is one access unit. Read it here, in the clear, before the
+     * child RTP muxer packetises (and, with PEP / HKEP, encrypts) it: its NAL
+     * unit byte count, in-band parameter sets and HRD SEI, from which its pace
+     * is capped at the HRD ceiling. The packetizer emits all of its packets
+     * (marker on the last) inside the av_write_frame() call below, so the
+     * per-packet path and the marker handler see this AU's state. */
+    if (st->is_compressed_video) {
+        const RTPMuxContext *rmx = st->child_rtp_ctx->priv_data;
+        IpmxAuNalCtx cx = {
+            .st      = st,
+            .is_h265 = st->compressed_codec_id == AV_CODEC_ID_HEVC,
+            .log_ctx = s,
+        };
+        ipmx_walk_au_nal_units(pkt->data, pkt->size, rmx->nal_length_size,
+                               ipmx_au_nal_cb, &cx);
+        st->comp_au_nal_unit_bytes = cx.nal_unit_bytes;
+        ipmx_hrd_apply_ceiling(st, s);
+    }
+
     av_packet_ref(&local, pkt);
     local.stream_index = 0;
     if (pkt->pts != AV_NOPTS_VALUE)
@@ -4735,12 +5265,19 @@ static int ipmx_write_trailer(AVFormatContext *s)
         if (!st->is_compressed_video || !st->hrd_present) continue;
         av_log(s, AV_LOG_INFO,
                "IPMX HRD summary stream=%d: %s cbr_flag=%d AUs=%d "
-               "final_t_r_n=%lld µs anchor_offset=%lld µs init_delay_first=%lld µs\n",
+               "final_t_r_n=%lld µs anchor_offset=%lld µs init_delay_first=%lld µs "
+               "bp_sei=%u pt_sei=%u\n",
                i, st->compressed_codec_id == AV_CODEC_ID_H264 ? "H.264" : "H.265",
                st->hrd_cbr_flag, st->hrd_au_idx,
                (long long)st->hrd_t_r_n_j_us,
                (long long)st->hrd_anchor_offset_us,
-               (long long)st->hrd_init_delay_first_us);
+               (long long)st->hrd_init_delay_first_us,
+               st->hrd_bp_sei_count, st->hrd_pt_sei_count);
+        if (st->hrd_au_idx > 0 && (!st->hrd_bp_sei_count || !st->hrd_pt_sei_count))
+            av_log(s, AV_LOG_WARNING,
+                   "IPMX HRD stream=%d: the SPS declares HRD parameters but no %s SEI "
+                   "was parsed; HRD timing (t_r,n, ceiling, diagnostics) was not applied\n",
+                   i, !st->hrd_bp_sei_count ? "buffering_period" : "pic_timing");
     }
 
     /* Per-stream producer back-pressure summary. Logs only when the
@@ -4795,9 +5332,10 @@ static int ipmx_write_trailer(AVFormatContext *s)
         }
     }
 
-    /* Dump in-memory pacer trace (if enabled) before freeing. */
+    /* Dump in-memory pacer and HRD traces (if enabled) before freeing. */
     ipmx_pacer_dump_trace(ctx, s);
     av_freep(&ctx->pacer.trace);
+    ipmx_hrd_dump_trace(ctx, s);
 
     for (i = 0; i < ctx->nb_streams; i++) {
         IpmxStreamRT *st = &ctx->streams[i];
@@ -4809,6 +5347,7 @@ static int ipmx_write_trailer(AVFormatContext *s)
         av_freep(&st->sps_data);
         av_freep(&st->pps_data);
         av_freep(&st->vps_data);
+        av_freep(&st->hrd_trace);
         if (st->hrd_au0_buf) {
             int k;
             for (k = 0; k < st->hrd_au0_buf_count; k++)
@@ -4836,6 +5375,8 @@ static const AVOption options[] = {
       OFFSET(refclk),        AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
     { "ipmx_mediaclk",       "mediaclk attribute body (e.g. \"sender\" or \"direct=0\")",
       OFFSET(mediaclk),      AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
+    { "cname",               "CNAME for the RTCP SDES item (default: ipmx@<src-ip>)",
+      OFFSET(cname),         AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
     { "ipmx_pace_beta",      "ST 2110-21 §7.1 β factor (1.00..1.10)",
       OFFSET(pace_beta),     AV_OPT_TYPE_DOUBLE, { .dbl = IPMX_DEFAULT_BETA }, 1.00, 1.10, E },
     { "ipmx_au_offset0_mode",
@@ -4918,6 +5459,12 @@ static const AVOption options[] = {
     { "ipmx_pacer_trace_file",
       "File to dump the pacer trace ring to on muxer close (NULL = stderr)",
       OFFSET(pacer_trace_file), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
+    { "ipmx_hrd_trace_cap",
+      "Per-stream HRD pacing trace capacity in access units (0 = disabled); ring keeps the latest entries.",
+      OFFSET(hrd_trace_cap), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1<<22, E },
+    { "ipmx_hrd_trace_file",
+      "File to dump the HRD pacing trace to on muxer close (NULL = stderr)",
+      OFFSET(hrd_trace_file), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
     { "ipmx_sdp_file",       "Path to write generated IPMX SDP",
       OFFSET(sdp_file),      AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
     { "ipmx_pcap_file",      "Path to write captured PCAP (DLT_EN10MB) of all RTP+RTCP packets",

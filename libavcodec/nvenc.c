@@ -1329,14 +1329,15 @@ static av_cold int nvenc_setup_h264_config(AVCodecContext *avctx)
 
     h264->idrPeriod = cc->gopLength;
 
-    if (IS_CBR(cc->rcParams.rateControlMode)) {
-        /* Older SDKs use outputBufferingPeriodSEI to control filler data */
-        h264->outputBufferingPeriodSEI = ctx->cbr_padding;
+    /* Decouple BP SEI emission from filler-data insertion: BP SEI is needed
+     * by the IPMX H.264 HRD pacer (TR-10-15c §15) in both CBR and VBR modes,
+     * so -cbr_padding controls BP alone; filler bytes stay CBR-only. */
+    h264->outputBufferingPeriodSEI = ctx->cbr_padding;
 
 #ifdef NVENC_HAVE_FILLER_DATA
+    if (IS_CBR(cc->rcParams.rateControlMode))
         h264->enableFillerDataInsertion = ctx->cbr_padding;
 #endif
-    }
 
     h264->outputPictureTimingSEI = 1;
 
@@ -1533,14 +1534,19 @@ static av_cold int nvenc_setup_hevc_config(AVCodecContext *avctx)
 
     hevc->idrPeriod = cc->gopLength;
 
-    if (IS_CBR(cc->rcParams.rateControlMode)) {
-        /* Older SDKs use outputBufferingPeriodSEI to control filler data */
-        hevc->outputBufferingPeriodSEI = ctx->cbr_padding;
+    /* outputBufferingPeriodSEI emits the BP SEI carrying
+     * initial_cpb_removal_delay, which the IPMX muxer's H.265 HRD-aware
+     * pacer reads per TR-10-15b §15. The IPMX use case needs BP regardless
+     * of CBR/VBR (the BP just anchors the CPB schedule; VBR pacing still
+     * uses it via eq C-3). Decouple from IS_CBR so -cbr_padding 1 controls
+     * BP emission alone; the filler-data insertion below stays CBR-gated
+     * because filler bytes are meaningless in VBR. */
+    hevc->outputBufferingPeriodSEI = ctx->cbr_padding;
 
 #ifdef NVENC_HAVE_FILLER_DATA
+    if (IS_CBR(cc->rcParams.rateControlMode))
         hevc->enableFillerDataInsertion = ctx->cbr_padding;
 #endif
-    }
 
     hevc->outputPictureTimingSEI = 1;
 
@@ -2298,7 +2304,17 @@ av_cold int ff_nvenc_encode_init(AVCodecContext *avctx)
     if ((ret = nvenc_setup_surfaces(avctx)) < 0)
         return ret;
 
-    if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
+    /* Publish SPS/PPS [+VPS for HEVC] into avctx->extradata when either
+     * GLOBAL_HEADER (out-of-band-only — disableSPSPPS=1 / repeatSPSPPS=0 above
+     * strip the in-band copies) or AV_CODEC_FLAG2_EXTRADATA (publish-also;
+     * in-band SPS/PPS repetition stays on because the GLOBAL_HEADER-bound
+     * disable/repeat logic isn't triggered). Mirrors libx264.c and libx265.c
+     * so muxers that need extradata at write_header (e.g. the IPMX muxer
+     * reading SPS VUI HRD per TR-10-15c/b §15) can opt in without losing
+     * the in-band SPS repetition that RFC 6184 / 7798 receivers rely on
+     * to bootstrap mid-stream. */
+    if ((avctx->flags  & AV_CODEC_FLAG_GLOBAL_HEADER) ||
+        (avctx->flags2 & AV_CODEC_FLAG2_EXTRADATA)) {
         if ((ret = nvenc_setup_extradata(avctx)) < 0)
             return ret;
     }

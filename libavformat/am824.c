@@ -1102,7 +1102,8 @@ static int flush_interleaved(AVFormatContext *s)
      * Bit layout per AM824 32-bit word (BE):
      *   bits 31-30: 00 (reserved)
      *   bit 29:     B (block start — set on first frame of every 192-frame block,
-     *                  on the left subframe of signal 0 only, per AES3)
+     *                  on the left subframe of every signal; ST 2110-31 §5.4:
+     *                  B marks the first subframe of each AES3 signal's block)
      *   bit 28:     F (frame start — set on the left subframe of every signal pair)
      *   bits 27-24: P, C, U, V
      *   bits 23-0:  DATA24 */
@@ -1115,7 +1116,7 @@ static int flush_interleaved(AVFormatContext *s)
             int c_bit = (ctx->channel_status[sig][frame_idx >> 3]
                          >> (frame_idx & 7)) & 1;
             int u_bit = 0;
-            int block_start = (frame_idx == 0) && (sig == 0);
+            int block_start = (frame_idx == 0);
 
             for (ch = 0; ch < 2; ch++) {
                 int32_t sample = (int32_t)AV_RB32(src + ch * 4);

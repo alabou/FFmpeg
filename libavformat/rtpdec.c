@@ -758,7 +758,13 @@ static int rtp_add_sr_sidedata(RTPDemuxContext *s, AVPacket *pkt) {
  */
 static void finalize_packet(RTPDemuxContext *s, AVPacket *pkt, uint32_t timestamp)
 {
-    if (s->pending_sr) {
+    /* An SR maps the RTP timestamps of its own source only: after a sender
+     * restart (new SSRC, see rtp_new_source) an SR of the previous source
+     * would map the new random timestamp base to the wrong time. */
+    int sr_valid = s->last_sr.ntp_timestamp != AV_NOPTS_VALUE &&
+                   s->last_sr.ssrc == s->ssrc;
+
+    if (s->pending_sr && s->last_sr.ssrc == s->ssrc) {
         int ret = rtp_add_sr_sidedata(s, pkt);
         if (ret < 0)
             av_log(s->ic, AV_LOG_WARNING, "rtpdec: failed to add SR sidedata\n");
@@ -769,13 +775,13 @@ static void finalize_packet(RTPDemuxContext *s, AVPacket *pkt, uint32_t timestam
     if (timestamp == RTP_NOTS_VALUE)
         return;
 
-    if (s->last_sr.ntp_timestamp != AV_NOPTS_VALUE) {
+    if (sr_valid) {
         if (rtp_set_prft(s, pkt, timestamp) < 0) {
             av_log(s->ic, AV_LOG_WARNING, "rtpdec: failed to set prft");
         }
     }
 
-    if (s->last_sr.ntp_timestamp != AV_NOPTS_VALUE && s->ic->nb_streams > 1) {
+    if (sr_valid && s->ic->nb_streams > 1) {
         int64_t addend;
         int32_t delta_timestamp;
 
@@ -1076,12 +1082,45 @@ static int rtp_parse_queued_packet(RTPDemuxContext *s, AVPacket *pkt)
     return rv;
 }
 
+/* RFC 3550 §8.2: a new SSRC is a new synchronization source, e.g. a sender
+ * that restarted with a new random SSRC, sequence number and RTP timestamp
+ * base (§5.1). The reordering queue, the sequence statistics and the PEP /
+ * HDCP counter state belong to the previous source: comparing the new
+ * sequence numbers with them dropped the new source's packets as "too late"
+ * for up to 2^15 packets. Start over from this packet, and keep the
+ * unwrapped presentation timestamps continuous: the new source's first
+ * packet follows the previous source's last one by the elapsed wall time. */
+static void rtp_new_source(RTPDemuxContext *s, uint32_t ssrc, uint16_t seq,
+                           uint32_t timestamp, int64_t now)
+{
+    av_log(s->ic, AV_LOG_WARNING,
+           "RTP: SSRC changed from 0x%08"PRIX32" to 0x%08"PRIX32" (sender restart?); "
+           "resetting sequence, reordering and timestamp state\n", s->ssrc, ssrc);
+
+    ff_rtp_reset_packet_queue(s);
+    rtp_init_statistics(&s->statistics, seq - 1);   /* accepts this packet */
+
+    if (s->timestamp && s->st) {
+        int64_t gap = av_rescale_q(now - s->last_rtp_recv_time, AV_TIME_BASE_Q,
+                                   s->st->time_base);
+        s->unwrapped_timestamp += gap - (int32_t)(timestamp - s->timestamp);
+    }
+
+    /* The new source's PEP / HDCP input counter restarts; the short-header
+     * MSB reconstruction must not borrow the previous source's. */
+    s->encryption_input_ctr   = 0;
+    s->encryption_current_ctr = 0;
+
+    s->ssrc = ssrc;
+}
+
 static int rtp_parse_one_packet(RTPDemuxContext *s, AVPacket *pkt,
                                 uint8_t **bufptr, int len)
 {
     uint8_t *buf = bufptr ? *bufptr : NULL;
     int flags = 0;
     uint32_t timestamp;
+    int64_t received;
     int rv = 0;
 
     if (!buf) {
@@ -1115,8 +1154,17 @@ static int rtp_parse_one_packet(RTPDemuxContext *s, AVPacket *pkt,
         return rtcp_parse_packet(s, buf, len);
     }
 
+    received = av_gettime_relative();
+    if ((buf[1] & 0x7f) == s->payload_type) {
+        uint32_t ssrc = AV_RB32(buf + 8);
+        if (s->ssrc_from_data && ssrc != s->ssrc)
+            rtp_new_source(s, ssrc, AV_RB16(buf + 2), AV_RB32(buf + 4), received);
+        s->ssrc               = ssrc;
+        s->ssrc_from_data     = 1;
+        s->last_rtp_recv_time = received;
+    }
+
     if (s->st) {
-        int64_t received = av_gettime_relative();
         uint32_t arrival_ts = av_rescale_q(received, AV_TIME_BASE_Q,
                                            s->st->time_base);
         timestamp = AV_RB32(buf + 4);

@@ -65,6 +65,9 @@ typedef struct H265MetadataContext {
     int level;
     int level_guess;
     int level_warned;
+
+    int64_t nal_hrd_bit_rate;
+    int64_t nal_hrd_cpb_size;
 } H265MetadataContext;
 
 
@@ -160,10 +163,123 @@ static void h265_metadata_update_level(AVBSFContext *bsf,
     }
 }
 
+/* Largest value of the form (value_minus1 + 1) << (scale + shift), scale in
+ * 0..15 (H.265 E.3.3: BitRate shift 6, CpbSize shift 4), that does not exceed
+ * value, at the finest scale whose value_minus1 fits ue(v). */
+static int h265_metadata_hrd_encode(int64_t value, int shift,
+                                    uint8_t *scale, uint32_t *value_minus1)
+{
+    int s;
+
+    for (s = 0; s <= 15; s++) {
+        int64_t units = value >> (s + shift);
+        if (units >= 1 && units - 1 <= UINT32_MAX - 1) {
+            *scale        = s;
+            *value_minus1 = units - 1;
+            return 0;
+        }
+    }
+    return AVERROR(ERANGE);
+}
+
+/* Re-express a value_minus1 coded with old_scale at new_scale; fails when the
+ * value is not exactly representable at new_scale. */
+static int h265_metadata_hrd_rescale(uint32_t *value_minus1, int shift,
+                                     int old_scale, int new_scale)
+{
+    int64_t value = ((int64_t)*value_minus1 + 1) << (old_scale + shift);
+    int64_t units = value >> (new_scale + shift);
+
+    if (units < 1 || units - 1 > UINT32_MAX - 1 ||
+        units << (new_scale + shift) != value)
+        return AVERROR(ERANGE);
+    *value_minus1 = units - 1;
+    return 0;
+}
+
+/* Declare the NAL HRD (Type II) BitRate and/or CpbSize. Values shared with a
+ * VCL HRD through bit_rate_scale / cpb_size_scale keep their meaning. */
+static int h265_metadata_update_hrd(AVBSFContext *bsf,
+                                    H265RawHRDParameters *hrd,
+                                    int max_sub_layers_minus1)
+{
+    H265MetadataContext *ctx = bsf->priv_data;
+    H265RawSubLayerHRDParameters *nal = &hrd->nal_sub_layer_hrd_parameters[0];
+    H265RawSubLayerHRDParameters *vcl = &hrd->vcl_sub_layer_hrd_parameters[0];
+    uint8_t  bit_rate_scale = hrd->bit_rate_scale;
+    uint8_t  cpb_size_scale = hrd->cpb_size_scale;
+    uint32_t nal_bit_rate   = nal->bit_rate_value_minus1[0];
+    uint32_t nal_cpb_size   = nal->cpb_size_value_minus1[0];
+    uint32_t vcl_bit_rate   = vcl->bit_rate_value_minus1[0];
+    uint32_t vcl_cpb_size   = vcl->cpb_size_value_minus1[0];
+    int err;
+
+    if (!hrd->nal_hrd_parameters_present_flag) {
+        av_log(bsf, AV_LOG_ERROR, "Cannot set the NAL HRD bit rate or CPB "
+               "size: the stream has no NAL HRD parameters.\n");
+        return AVERROR(EINVAL);
+    }
+    if (max_sub_layers_minus1 > 0 || hrd->cpb_cnt_minus1[0] > 0 ||
+        hrd->sub_pic_hrd_params_present_flag) {
+        av_log(bsf, AV_LOG_ERROR, "Setting the NAL HRD bit rate or CPB size "
+               "is only supported for a single sub-layer and a single CPB "
+               "specification without sub-picture HRD parameters.\n");
+        return AVERROR_PATCHWELCOME;
+    }
+
+    if (ctx->nal_hrd_bit_rate > 0) {
+        err = h265_metadata_hrd_encode(ctx->nal_hrd_bit_rate, 6,
+                                       &bit_rate_scale, &nal_bit_rate);
+        if (err >= 0 && hrd->vcl_hrd_parameters_present_flag)
+            err = h265_metadata_hrd_rescale(&vcl_bit_rate, 6,
+                                            hrd->bit_rate_scale, bit_rate_scale);
+        if (err < 0) {
+            av_log(bsf, AV_LOG_ERROR, "NAL HRD bit rate %"PRId64" is not "
+                   "representable.\n", ctx->nal_hrd_bit_rate);
+            return err;
+        }
+    }
+    if (ctx->nal_hrd_cpb_size > 0) {
+        err = h265_metadata_hrd_encode(ctx->nal_hrd_cpb_size, 4,
+                                       &cpb_size_scale, &nal_cpb_size);
+        if (err >= 0 && hrd->vcl_hrd_parameters_present_flag)
+            err = h265_metadata_hrd_rescale(&vcl_cpb_size, 4,
+                                            hrd->cpb_size_scale, cpb_size_scale);
+        if (err < 0) {
+            av_log(bsf, AV_LOG_ERROR, "NAL HRD CPB size %"PRId64" is not "
+                   "representable.\n", ctx->nal_hrd_cpb_size);
+            return err;
+        }
+    }
+
+    hrd->bit_rate_scale             = bit_rate_scale;
+    hrd->cpb_size_scale             = cpb_size_scale;
+    nal->bit_rate_value_minus1[0]   = nal_bit_rate;
+    nal->cpb_size_value_minus1[0]   = nal_cpb_size;
+    if (hrd->vcl_hrd_parameters_present_flag) {
+        vcl->bit_rate_value_minus1[0] = vcl_bit_rate;
+        vcl->cpb_size_value_minus1[0] = vcl_cpb_size;
+    }
+    av_log(bsf, AV_LOG_VERBOSE, "NAL HRD BitRate %"PRId64", CpbSize %"PRId64".\n",
+           ((int64_t)nal_bit_rate + 1) << (bit_rate_scale + 6),
+           ((int64_t)nal_cpb_size + 1) << (cpb_size_scale + 4));
+    return 0;
+}
+
 static int h265_metadata_update_vps(AVBSFContext *bsf,
                                     H265RawVPS *vps)
 {
     H265MetadataContext *ctx = bsf->priv_data;
+
+    if (ctx->nal_hrd_bit_rate > 0 || ctx->nal_hrd_cpb_size > 0) {
+        int i, err;
+        for (i = 0; i < vps->vps_num_hrd_parameters; i++) {
+            err = h265_metadata_update_hrd(bsf, &vps->hrd_parameters[i],
+                                           vps->vps_max_sub_layers_minus1);
+            if (err < 0)
+                return err;
+        }
+    }
 
     if (ctx->tick_rate.num && ctx->tick_rate.den) {
         int num, den;
@@ -407,6 +523,19 @@ static int h265_metadata_update_sps(AVBSFContext *bsf,
     if (need_vui)
         sps->vui_parameters_present_flag = 1;
 
+    if (ctx->nal_hrd_bit_rate > 0 || ctx->nal_hrd_cpb_size > 0) {
+        if (!sps->vui_parameters_present_flag ||
+            !sps->vui.vui_hrd_parameters_present_flag) {
+            av_log(bsf, AV_LOG_ERROR, "Cannot set the NAL HRD bit rate or CPB "
+                   "size: the SPS has no VUI HRD parameters.\n");
+            return AVERROR(EINVAL);
+        }
+        ret = h265_metadata_update_hrd(bsf, &sps->vui.hrd_parameters,
+                                       sps->sps_max_sub_layers_minus1);
+        if (ret < 0)
+            return ret;
+    }
+
     h265_metadata_update_level(bsf, &sps->profile_tier_level.general_level_idc);
 
     return 0;
@@ -573,6 +702,15 @@ static const AVOption h265_metadata_options[] = {
     { LEVEL("6.2", 186) },
     { LEVEL("8.5", 255) },
 #undef LEVEL
+
+    { "nal_hrd_bit_rate",
+        "Set the NAL HRD BitRate in bits/s (E.3.3; rounded down to a representable value)",
+        OFFSET(nal_hrd_bit_rate), AV_OPT_TYPE_INT64,
+        { .i64 = 0 }, 0, INT64_C(1) << 53, FLAGS },
+    { "nal_hrd_cpb_size",
+        "Set the NAL HRD CpbSize in bits (E.3.3; rounded down to a representable value)",
+        OFFSET(nal_hrd_cpb_size), AV_OPT_TYPE_INT64,
+        { .i64 = 0 }, 0, INT64_C(1) << 53, FLAGS },
 
     { NULL }
 };

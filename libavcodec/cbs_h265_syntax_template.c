@@ -311,9 +311,9 @@ static int FUNC(hrd_parameters)(CodedBitstreamContext *ctx, RWContext *rw,
             infer(cpb_cnt_minus1[i], 0);
 
         if (current->nal_hrd_parameters_present_flag)
-            CHECK(FUNC(sub_layer_hrd_parameters)(ctx, rw, current, 0, i));
-        if (current->vcl_hrd_parameters_present_flag)
             CHECK(FUNC(sub_layer_hrd_parameters)(ctx, rw, current, 1, i));
+        if (current->vcl_hrd_parameters_present_flag)
+            CHECK(FUNC(sub_layer_hrd_parameters)(ctx, rw, current, 0, i));
     }
 
     return 0;

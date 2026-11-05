@@ -389,7 +389,11 @@ static int am824_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
             int pcuv;
             int c_bit, u_bit, v_bit, p_bit;
             int frame_start = ((ch % 2) == 0); /* F=1 for first subframe of each AES3 pair */
-            int b_flag = (block_start && frame_start && (ch < 2));
+            /* ST 2110-31 §5.4: B marks the first subframe of an AES3 block.
+             * Each pair is its own AES3 signal with its own channel-status
+             * block (C bits below are indexed per pair by framing_index),
+             * so every pair's first subframe carries B=1 at block start. */
+            int b_flag = (block_start && frame_start);
 
             /* Extract DATA24 from S32 input (upper 24 bits) */
             data24 = ((uint32_t)samples[sample * nb_channels + ch] >> 8) & 0x00FFFFFF;

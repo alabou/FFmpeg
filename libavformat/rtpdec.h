@@ -151,6 +151,8 @@ struct RTPDemuxContext {
     AVStream *st;
     int payload_type;
     uint32_t ssrc;
+    int ssrc_from_data;          ///< 1 once ssrc was taken from a received RTP data packet (not an SDP a=ssrc)
+    int64_t last_rtp_recv_time;  ///< av_gettime_relative() of the last RTP data packet of this payload type
     uint16_t seq;
     uint32_t timestamp;
     uint32_t base_timestamp;
